@@ -414,6 +414,23 @@ impl OrderValidator {
         let mut res = Ok(());
         let has_wrappers = !app_data.inner.protocol.wrappers.is_empty();
 
+        // Check if there's a flashloan hint that covers the sell token.
+        // When running against nodes that don't support debug_traceCall (e.g.
+        // Tenderly forks), the automatic balance-override detection fails
+        // silently, causing the balance simulation to report InsufficientBalance
+        // even though the flashloan would provide the tokens during settlement.
+        // In that case we fall back to this flag to bypass the check, matching
+        // the behaviour from CoW services <= v2.327.0.
+        let has_flashloan_for_sell_token =
+            app_data
+                .inner
+                .protocol
+                .flashloan
+                .as_ref()
+                .is_some_and(|loan| {
+                    loan.token == order.data().sell_token && loan.amount >= order.data().sell_amount
+                });
+
         // Simulate transferring a small token balance into the settlement contract.
         // As a spam protection we require that an account must have at least 1 atom
         // of the sell_token. However, some tokens (e.g. rebasing tokens) actually run
@@ -448,7 +465,10 @@ impl OrderValidator {
                     TransferSimulationError::InsufficientAllowance
                     | TransferSimulationError::InsufficientBalance
                     | TransferSimulationError::TransferFailed,
-                ) if order.signature == Signature::PreSign || has_wrappers => {
+                ) if order.signature == Signature::PreSign
+                    || has_flashloan_for_sell_token
+                    || has_wrappers =>
+                {
                     // Pre-sign orders do not require sufficient balance or allowance.
                     // The idea is that this allows smart contracts to place orders bundled with
                     // other transactions that either produce the required balance or set the
@@ -458,6 +478,9 @@ impl OrderValidator {
                     //
                     // Similarly, orders with wrappers may produce the required balance or
                     // allowance as part of the wrapper execution.
+                    //
+                    // Orders with a matching flashloan hint are also exempt because the
+                    // flashloan will provide the sell tokens during settlement.
                     return Ok(());
                 }
                 Err(err) => match err {
