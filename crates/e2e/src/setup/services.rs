@@ -138,7 +138,6 @@ impl<'a> Services<'a> {
             format!("--node-ws-url={NODE_WS_HOST}"),
             "--simulation-node-url=http://localhost:8545".to_string(),
             "--native-price-cache-max-age=2s".to_string(),
-            "--native-price-prefetch-time=500ms".to_string(),
             format!(
                 "--hooks-contract-address={:?}",
                 self.contracts.hooks.address()
@@ -150,6 +149,7 @@ impl<'a> Services<'a> {
     fn autopilot_arguments(&self) -> impl Iterator<Item = String> + use<> {
         self.api_autopilot_arguments().chain([
             "--quote-timeout=10s".to_string(),
+            "--native-price-prefetch-time=500ms".to_string(),
             "--native-price-estimators=Driver|test_quoter|http://localhost:11088/test_solver"
                 .to_string(),
         ])
@@ -157,9 +157,7 @@ impl<'a> Services<'a> {
 
     fn api_autopilot_solver_arguments(&self) -> impl Iterator<Item = String> + use<> {
         [
-            "--baseline-sources=None".to_string(),
             "--network-block-interval=1s".to_string(),
-            "--solver-competition-auth=super_secret_key".to_string(),
             format!(
                 "--settlement-contract-address={:?}",
                 self.contracts.gp_settlement.address()
@@ -204,8 +202,6 @@ impl<'a> Services<'a> {
 
         let args = [
             "autopilot".to_string(),
-            "--non-settling-solvers-blacklisting-enabled=false".to_string(),
-            "--low-settling-solvers-blacklisting-enabled=false".to_string(),
             "--max-run-loop-delay=100ms".to_string(),
             "--run-loop-native-price-timeout=500ms".to_string(),
             format!("--ethflow-contracts={ethflow_contracts}"),
@@ -926,7 +922,7 @@ impl<'a> Services<'a> {
 
     async fn mint_block(&self) {
         tracing::info!("mining block");
-        self.web3.alloy.evm_mine(None).await.unwrap();
+        self.web3.provider.evm_mine(None).await.unwrap();
     }
 }
 

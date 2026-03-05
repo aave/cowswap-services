@@ -6,7 +6,7 @@ use {
     anyhow::bail,
     autopilot::database::onchain_order_events::ethflow_events::WRAP_ALL_SELECTOR,
     contracts::alloy::{CoWSwapEthFlow, ERC20Mintable, WETH9},
-    database::order_events::OrderEventLabel,
+    database::{byte_array::ByteArray, order_events::OrderEventLabel},
     e2e::setup::{
         ACCOUNT_ENDPOINT,
         API_HOST,
@@ -49,6 +49,7 @@ use {
     refunder::RefundStatus,
     reqwest::Client,
     shared::signature_validator::check_erc1271_result,
+    std::ops::DerefMut,
 };
 
 const DAI_PER_ETH: u64 = 1_000;
@@ -152,7 +153,7 @@ async fn eth_flow_tx(web3: Web3) {
     let quote: OrderQuoteResponse = test_submit_quote(&services, &quote_request).await;
 
     let valid_to = chrono::offset::Utc::now().timestamp() as u32
-        + timestamp_of_current_block_in_seconds(&web3.alloy)
+        + timestamp_of_current_block_in_seconds(&web3.provider)
             .await
             .unwrap()
         + 3600;
@@ -243,6 +244,28 @@ async fn eth_flow_tx(web3: Web3) {
         .await
         .unwrap();
     assert_eq!(allowance, alloy::primitives::U256::ZERO);
+
+    // Check that true_valid_to is equal to the ethflow_order's valid to
+    let uid = ethflow_order
+        .uid(onchain.contracts(), ethflow_contract)
+        .await;
+    let mut db = services.db().acquire().await.unwrap();
+    let true_valid_to: (i64,) = sqlx::query_as("SELECT true_valid_to FROM orders WHERE uid = $1")
+        .bind(ByteArray(uid.0))
+        .fetch_one(db.deref_mut())
+        .await
+        .unwrap();
+    assert_eq!(
+        true_valid_to.0,
+        services
+            .get_order(&uid)
+            .await
+            .unwrap()
+            .metadata
+            .ethflow_data
+            .unwrap()
+            .user_valid_to
+    );
 }
 
 async fn eth_flow_without_quote(web3: Web3) {
@@ -260,7 +283,7 @@ async fn eth_flow_without_quote(web3: Web3) {
     services.start_protocol(solver).await;
 
     let valid_to = chrono::offset::Utc::now().timestamp() as u32
-        + timestamp_of_current_block_in_seconds(&web3.alloy)
+        + timestamp_of_current_block_in_seconds(&web3.provider)
             .await
             .unwrap()
         + 3600;
@@ -311,7 +334,7 @@ async fn eth_flow_indexing_after_refund(web3: Web3) {
     services.start_protocol(solver).await;
 
     // Create an order that only exists to be cancelled.
-    let valid_to = timestamp_of_current_block_in_seconds(&web3.alloy)
+    let valid_to = timestamp_of_current_block_in_seconds(&web3.provider)
         .await
         .unwrap()
         + 60;
@@ -348,7 +371,7 @@ async fn eth_flow_indexing_after_refund(web3: Web3) {
     let receiver = Address::repeat_byte(0x42);
     let sell_amount = 1u64.eth();
     let valid_to = chrono::offset::Utc::now().timestamp() as u32
-        + timestamp_of_current_block_in_seconds(&web3.alloy)
+        + timestamp_of_current_block_in_seconds(&web3.provider)
             .await
             .unwrap()
         + 60;
@@ -498,7 +521,7 @@ async fn test_order_was_settled(ethflow_order: &ExtendedEthFlowOrder, onchain: &
     wait_for_condition(TIMEOUT, || async {
         onchain.mint_block().await;
         let buy_token =
-            ERC20Mintable::Instance::new(ethflow_order.0.buyToken, onchain.web3().alloy.clone());
+            ERC20Mintable::Instance::new(ethflow_order.0.buyToken, onchain.web3().provider.clone());
         let receiver_buy_token_balance = buy_token
             .balanceOf(ethflow_order.0.receiver)
             .call()
@@ -836,7 +859,7 @@ async fn eth_flow_zero_buy_amount(web3: Web3) {
 
     let place_order = async |trader: TestAccount, buy_amount: u64| {
         let valid_to = chrono::offset::Utc::now().timestamp() as u32
-            + timestamp_of_current_block_in_seconds(&web3.alloy)
+            + timestamp_of_current_block_in_seconds(&web3.provider)
                 .await
                 .unwrap()
             + 3600;

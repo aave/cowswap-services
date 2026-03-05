@@ -23,7 +23,7 @@ fn parse_order_replacement_error(status: StatusCode, body: &str) -> Option<Order
     let error: ApiError = serde_json::from_str(body).ok()?;
 
     match status {
-        StatusCode::BAD_REQUEST => match error.error_type {
+        StatusCode::BAD_REQUEST => match error.error_type.as_ref() {
             "InvalidSignature" => Some(OrderReplacementError::InvalidSignature),
             "OldOrderActivelyBidOn" => Some(OrderReplacementError::OldOrderActivelyBidOn),
             _ => None,
@@ -46,7 +46,7 @@ fn parse_order_cancellation_error(
     let error: ApiError = serde_json::from_str(body).ok()?;
 
     match status {
-        StatusCode::BAD_REQUEST => match error.error_type {
+        StatusCode::BAD_REQUEST => match error.error_type.as_ref() {
             "InvalidSignature" => Some(OrderCancellationError::InvalidSignature),
             "AlreadyCancelled" => Some(OrderCancellationError::AlreadyCancelled),
             "OrderFullyExecuted" => Some(OrderCancellationError::OrderFullyExecuted),
@@ -153,7 +153,7 @@ async fn try_replace_unreplaceable_order_test(web3: Web3) {
         .unwrap();
 
     // disable auto mining to prevent order being immediately executed
-    web3.alloy.evm_set_automine(false).await.unwrap();
+    web3.provider.evm_set_automine(false).await.unwrap();
 
     // Place Orders
     let services = Services::new(&onchain).await;
@@ -224,7 +224,7 @@ async fn try_replace_unreplaceable_order_test(web3: Web3) {
     );
 
     // Continue automining so our order can be executed
-    web3.alloy
+    web3.provider
         .evm_set_automine(true)
         .await
         .expect("Must be able to disable auto-mining");
