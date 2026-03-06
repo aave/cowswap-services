@@ -1219,6 +1219,7 @@ mod tests {
             solver_address.to_string(),
             None,
             crate::arguments::Account::Address(solver_address),
+            false,
         )
         .await
         .unwrap();

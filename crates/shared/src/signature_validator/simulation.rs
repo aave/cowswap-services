@@ -8,7 +8,7 @@ use {
     crate::price_estimation::trade_verifier::balance_overrides::BalanceOverriding,
     alloy::{
         dyn_abi::SolType,
-        primitives::{Address, U256},
+        primitives::Address,
         rpc::types::state::StateOverride,
         sol_types::{SolCall, sol_data},
         transports::RpcError,
@@ -19,7 +19,8 @@ use {
         GPv2Settlement,
         support::Signatures,
     },
-    ethrpc::{Web3, alloy::ProviderLabelingExt},
+    ethrpc::{Web3, alloy::conversions::IntoLegacy},
+    primitive_types::U256,
     std::sync::Arc,
     tracing::instrument,
 };
@@ -43,7 +44,7 @@ impl Validator {
         vault_relayer: Address,
         balance_overrider: Arc<dyn BalanceOverriding>,
     ) -> Self {
-        let web3 = web3.labeled("signatureValidation");
+        let web3 = ethrpc::instrumented::instrument_with_label(web3, "signatureValidation".into());
         Self {
             signatures_address,
             settlement,
@@ -63,7 +64,7 @@ impl Validator {
         // change), the order's validity can be directly determined by whether
         // the signature matches the expected hash of the order data, checked
         // with isValidSignature method called on the owner's contract
-        let contract = ERC1271SignatureValidator::new(check.signer, &self.web3.provider);
+        let contract = ERC1271SignatureValidator::new(check.signer, &self.web3.alloy);
         let magic_bytes = contract
             .isValidSignature(check.hash.into(), check.signature.clone().into())
             .call()
@@ -147,12 +148,14 @@ impl Validator {
             })
             .map_err(|_| SignatureValidationError::Invalid)?;
 
-        let gas_used = <sol_data::Uint<256>>::abi_decode(&response_bytes.0).with_context(|| {
-            format!(
-                "could not decode signature check result: {}",
-                const_hex::encode(&response_bytes.0)
-            )
-        })?;
+        let gas_used = <sol_data::Uint<256>>::abi_decode(&response_bytes.0)
+            .with_context(|| {
+                format!(
+                    "could not decode signature check result: {}",
+                    const_hex::encode(&response_bytes.0)
+                )
+            })?
+            .into_legacy();
 
         Ok(Simulation { gas_used })
     }

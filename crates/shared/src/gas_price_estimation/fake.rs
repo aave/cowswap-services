@@ -1,33 +1,20 @@
 use {
-    crate::gas_price_estimation::GasPriceEstimating,
-    alloy::eips::eip1559::Eip1559Estimation,
+    crate::gas_price_estimation::{GasPriceEstimating, price::GasPrice1559},
     anyhow::Result,
 };
 
-pub struct FakeGasPriceEstimator(pub Eip1559Estimation);
-
-impl Default for FakeGasPriceEstimator {
-    fn default() -> Self {
-        Self(Eip1559Estimation {
-            max_fee_per_gas: Default::default(),
-            max_priority_fee_per_gas: Default::default(),
-        })
-    }
-}
+#[derive(Default)]
+pub struct FakeGasPriceEstimator(pub GasPrice1559);
 
 impl FakeGasPriceEstimator {
-    pub fn new(gas_price: Eip1559Estimation) -> Self {
+    pub fn new(gas_price: GasPrice1559) -> Self {
         Self(gas_price)
     }
 }
 
 #[async_trait::async_trait]
 impl GasPriceEstimating for FakeGasPriceEstimator {
-    async fn estimate(&self) -> Result<Eip1559Estimation> {
+    async fn estimate(&self) -> Result<GasPrice1559> {
         Ok(self.0)
-    }
-
-    async fn base_fee(&self) -> Result<Option<u64>> {
-        Ok(Default::default())
     }
 }

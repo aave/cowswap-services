@@ -1,7 +1,7 @@
 use {
     crate::{
         account_balances::{self, BalanceFetching, TransferSimulationError},
-        bad_token::list_based::DenyListedTokens,
+        bad_token::{BadTokenDetecting, TokenQuality},
         code_fetching::CodeFetching,
         order_quoting::{
             CalculateQuoteError,
@@ -23,6 +23,7 @@ use {
     app_data::{AppDataHash, Hook, Hooks, ValidatedAppData, Validator},
     async_trait::async_trait,
     contracts::alloy::{HooksTrampoline, WETH9},
+    ethrpc::alloy::conversions::{IntoAlloy, IntoLegacy},
     model::{
         DomainSeparator,
         interaction::InteractionData,
@@ -250,7 +251,7 @@ pub struct OrderValidator {
     banned_users: Arc<order_validation::banned::Users>,
     validity_configuration: OrderValidPeriodConfiguration,
     eip1271_skip_creation_validation: bool,
-    deny_listed_tokens: DenyListedTokens,
+    bad_token_detector: Arc<dyn BadTokenDetecting>,
     hooks: HooksTrampoline::Instance,
     /// For Full-Validation: performed time of order placement
     quoter: Arc<dyn OrderQuoting>,
@@ -321,7 +322,7 @@ impl OrderValidator {
         banned_users: Arc<order_validation::banned::Users>,
         validity_configuration: OrderValidPeriodConfiguration,
         eip1271_skip_creation_validation: bool,
-        deny_listed_tokens: DenyListedTokens,
+        bad_token_detector: Arc<dyn BadTokenDetecting>,
         hooks: HooksTrampoline::Instance,
         quoter: Arc<dyn OrderQuoting>,
         balance_fetcher: Arc<dyn BalanceFetching>,
@@ -338,7 +339,7 @@ impl OrderValidator {
             banned_users,
             validity_configuration,
             eip1271_skip_creation_validation,
-            deny_listed_tokens,
+            bad_token_detector,
             hooks,
             quoter,
             balance_fetcher,
@@ -412,7 +413,6 @@ impl OrderValidator {
         app_data: &OrderAppData,
     ) -> Result<(), ValidationError> {
         let mut res = Ok(());
-        let has_wrappers = !app_data.inner.protocol.wrappers.is_empty();
 
         // Check if there's a flashloan hint that covers the sell token.
         // When running against nodes that don't support debug_traceCall (e.g.
@@ -421,15 +421,15 @@ impl OrderValidator {
         // even though the flashloan would provide the tokens during settlement.
         // In that case we fall back to this flag to bypass the check, matching
         // the behaviour from CoW services <= v2.327.0.
-        let has_flashloan_for_sell_token =
-            app_data
-                .inner
-                .protocol
-                .flashloan
-                .as_ref()
-                .is_some_and(|loan| {
-                    loan.token == order.data().sell_token && loan.amount >= order.data().sell_amount
-                });
+        let has_flashloan_for_sell_token = app_data
+            .inner
+            .protocol
+            .flashloan
+            .as_ref()
+            .is_some_and(|loan| {
+                loan.token == order.data().sell_token
+                    && loan.amount >= order.data().sell_amount
+            });
 
         // Simulate transferring a small token balance into the settlement contract.
         // As a spam protection we require that an account must have at least 1 atom
@@ -466,8 +466,7 @@ impl OrderValidator {
                     | TransferSimulationError::InsufficientBalance
                     | TransferSimulationError::TransferFailed,
                 ) if order.signature == Signature::PreSign
-                    || has_flashloan_for_sell_token
-                    || has_wrappers =>
+                    || has_flashloan_for_sell_token =>
                 {
                     // Pre-sign orders do not require sufficient balance or allowance.
                     // The idea is that this allows smart contracts to place orders bundled with
@@ -475,9 +474,6 @@ impl OrderValidator {
                     // allowance. This would, for example, allow a Gnosis Safe to bundle the
                     // pre-signature transaction with a WETH wrap and WETH approval to the vault
                     // relayer contract.
-                    //
-                    // Similarly, orders with wrappers may produce the required balance or
-                    // allowance as part of the wrapper execution.
                     //
                     // Orders with a matching flashloan hint are also exempt because the
                     // flashloan will provide the sell tokens during settlement.
@@ -547,12 +543,14 @@ impl OrderValidating for OrderValidator {
             return Err(PartialValidationError::InvalidNativeSellToken);
         }
 
-        for token in &[order.sell_token, order.buy_token] {
-            if self.deny_listed_tokens.contains(token) {
-                return Err(PartialValidationError::UnsupportedToken {
-                    token: *token,
-                    reason: "token is deny listed".to_string(),
-                });
+        for &token in &[order.sell_token, order.buy_token] {
+            if let TokenQuality::Bad { reason } = self
+                .bad_token_detector
+                .detect(token)
+                .await
+                .map_err(PartialValidationError::Other)?
+            {
+                return Err(PartialValidationError::UnsupportedToken { token, reason });
             }
         }
 
@@ -632,9 +630,10 @@ impl OrderValidating for OrderValidator {
         // Happens before signature verification because a miscalculated app data hash
         // by the API user would lead to being unable to validate the signature below.
         let app_data = self.validate_app_data(&order.app_data, &full_app_data_override)?;
-        let app_data_signer = app_data.inner.protocol.signer;
+        let app_data_signer = app_data.inner.protocol.signer.map(IntoLegacy::into_legacy);
 
-        let owner = order.verify_owner(domain_separator, app_data_signer)?;
+        let owner =
+            order.verify_owner(domain_separator, app_data_signer.map(IntoAlloy::into_alloy))?;
         tracing::debug!(?owner, "recovered owner from order and signature");
         let signing_scheme = order.signature.scheme();
         let data = OrderData {
@@ -778,7 +777,6 @@ impl OrderValidating for OrderValidator {
                             },
                             data.kind,
                         ) {
-                            tracing::debug!(%uid, ?owner, ?class, "order being flagged as outside market price");
                             self.check_max_limit_orders(owner).await?;
                         }
                         (class, Some(quote))
@@ -810,7 +808,6 @@ impl OrderValidating for OrderValidator {
                     },
                     data.kind,
                 ) {
-                    tracing::debug!(%uid, ?owner, ?class, "order being flagged as outside market price");
                     self.check_max_limit_orders(owner).await?;
                 }
                 (OrderClass::Limit, None)
@@ -1027,7 +1024,14 @@ pub fn is_order_outside_market_price(
         }
     };
 
-    check().unwrap_or(true)
+    check().unwrap_or_else(|| {
+        tracing::warn!(
+            ?order,
+            ?quote,
+            "failed to check if order is outside market price"
+        );
+        true
+    })
 }
 
 pub struct InvalidSigningScheme;
@@ -1058,6 +1062,7 @@ mod tests {
         super::*,
         crate::{
             account_balances::MockBalanceFetching,
+            bad_token::{MockBadTokenDetecting, TokenQuality},
             code_fetching::MockCodeFetching,
             order_quoting::{FindQuoteError, MockOrderQuoting},
             signature_validator::MockSignatureValidating,
@@ -1080,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_validate_err() {
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validity_configuration = OrderValidPeriodConfiguration {
             min: Duration::from_secs(1),
             max_market: Duration::from_secs(100),
@@ -1096,7 +1101,7 @@ mod tests {
             Arc::new(order_validation::banned::Users::from_set(banned_users)),
             validity_configuration,
             false,
-            DenyListedTokens::default(),
+            Arc::new(MockBadTokenDetecting::new()),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1227,12 +1232,22 @@ mod tests {
     #[tokio::test]
     async fn pre_validate_ok() {
         let native_token =
-            WETH9::Instance::new(Address::repeat_byte(0xef), ethrpc::mock::web3().provider);
+            WETH9::Instance::new(Address::repeat_byte(0xef), ethrpc::mock::web3().alloy);
         let validity_configuration = OrderValidPeriodConfiguration {
             min: Duration::from_secs(1),
             max_market: Duration::from_secs(100),
             max_limit: Duration::from_secs(200),
         };
+
+        let mut bad_token_detector = MockBadTokenDetecting::new();
+        bad_token_detector
+            .expect_detect()
+            .with(eq(Address::with_last_byte(1)))
+            .returning(|_| Ok(TokenQuality::Good));
+        bad_token_detector
+            .expect_detect()
+            .with(eq(Address::with_last_byte(2)))
+            .returning(|_| Ok(TokenQuality::Good));
 
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
@@ -1241,7 +1256,7 @@ mod tests {
             Arc::new(order_validation::banned::Users::none()),
             validity_configuration,
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1308,12 +1323,22 @@ mod tests {
     #[tokio::test]
     async fn pre_validate_same_tokens_allow_sell() {
         let native_token =
-            WETH9::Instance::new(Address::repeat_byte(0xef), ethrpc::mock::web3().provider);
+            WETH9::Instance::new(Address::repeat_byte(0xef), ethrpc::mock::web3().alloy);
         let validity_configuration = OrderValidPeriodConfiguration {
             min: Duration::from_secs(1),
             max_market: Duration::from_secs(100),
             max_limit: Duration::from_secs(200),
         };
+
+        let mut bad_token_detector = MockBadTokenDetecting::new();
+        bad_token_detector
+            .expect_detect()
+            .with(eq(Address::with_last_byte(1)))
+            .returning(|_| Ok(TokenQuality::Good));
+        bad_token_detector
+            .expect_detect()
+            .with(eq(Address::with_last_byte(2)))
+            .returning(|_| Ok(TokenQuality::Good));
 
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
@@ -1322,7 +1347,7 @@ mod tests {
             Arc::new(order_validation::banned::Users::none()),
             validity_configuration,
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1377,10 +1402,14 @@ mod tests {
     #[tokio::test]
     async fn post_validate_ok() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
@@ -1402,7 +1431,7 @@ mod tests {
 
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
@@ -1412,7 +1441,7 @@ mod tests {
                 max_limit: Duration::from_secs(200),
             },
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             hooks.clone(),
             Arc::new(order_quoter),
             Arc::new(balance_fetcher),
@@ -1583,6 +1612,7 @@ mod tests {
     #[tokio::test]
     async fn post_validate_too_many_limit_orders() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter.expect_find_quote().returning(|_, _| {
             Ok(Quote {
@@ -1593,6 +1623,9 @@ mod tests {
                 fee_amount: Default::default(),
             })
         });
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
@@ -1610,7 +1643,7 @@ mod tests {
             .expect_count()
             .returning(|_| Ok(MAX_LIMIT_ORDERS_PER_USER));
 
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
@@ -1620,7 +1653,7 @@ mod tests {
                 max_limit: Duration::from_secs(200),
             },
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1667,10 +1700,14 @@ mod tests {
     #[tokio::test]
     async fn post_limit_does_not_apply_to_in_market_orders() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
@@ -1687,13 +1724,13 @@ mod tests {
         limit_order_counter
             .expect_count()
             .returning(|_| Ok(MAX_LIMIT_ORDERS_PER_USER));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1739,22 +1776,26 @@ mod tests {
     #[tokio::test]
     async fn post_validate_err_zero_amount() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1793,22 +1834,26 @@ mod tests {
     #[tokio::test]
     async fn post_validate_err_wrong_owner() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1849,24 +1894,29 @@ mod tests {
     #[tokio::test]
     async fn post_validate_err_unsupported_token() {
         let mut order_quoter = MockOrderQuoting::new();
-        let deny_listed_tokens = DenyListedTokens::new(vec![Address::with_last_byte(1)]);
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector.expect_detect().returning(|_| {
+            Ok(TokenQuality::Bad {
+                reason: Default::default(),
+            })
+        });
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
 
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            deny_listed_tokens,
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1912,22 +1962,26 @@ mod tests {
     #[tokio::test]
     async fn post_validate_err_insufficient_balance() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Err(TransferSimulationError::InsufficientBalance));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -1968,11 +2022,15 @@ mod tests {
     #[tokio::test]
     async fn post_validate_err_invalid_eip1271_signature() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         let mut signature_validator = MockSignatureValidating::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
@@ -1981,13 +2039,13 @@ mod tests {
             .returning(|_| Err(SignatureValidationError::Invalid));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -2038,23 +2096,26 @@ mod tests {
             is_expected_error: impl Fn(ValidationError) -> bool,
         ) {
             let mut order_quoter = MockOrderQuoting::new();
+            let mut bad_token_detector = MockBadTokenDetecting::new();
             let mut balance_fetcher = MockBalanceFetching::new();
             order_quoter
                 .expect_find_quote()
                 .returning(|_, _| Ok(Default::default()));
+            bad_token_detector
+                .expect_detect()
+                .returning(|_| Ok(TokenQuality::Good));
             balance_fetcher
                 .expect_can_transfer()
                 .returning(move |_, _| Err(create_error()));
             let mut limit_order_counter = MockLimitOrderCounting::new();
             limit_order_counter.expect_count().returning(|_| Ok(0u64));
-            let native_token =
-                WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+            let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
             let validator = OrderValidator::new(
                 native_token,
                 Arc::new(order_validation::banned::Users::none()),
                 OrderValidPeriodConfiguration::any(),
                 false,
-                Default::default(),
+                Arc::new(bad_token_detector),
                 HooksTrampoline::Instance::new(
                     Address::from([0xcf; 20]),
                     ProviderBuilder::new()
@@ -2130,22 +2191,26 @@ mod tests {
     #[test]
     fn allows_insufficient_balance_for_orders_with_sufficient_flashloan_hint() {
         let mut order_quoter = MockOrderQuoting::new();
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
         order_quoter
             .expect_find_quote()
             .returning(|_, _| Ok(Default::default()));
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Err(TransferSimulationError::InsufficientBalance));
         let mut limit_order_counter = MockLimitOrderCounting::new();
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         let validator = OrderValidator::new(
             native_token,
             Arc::new(order_validation::banned::Users::none()),
             OrderValidPeriodConfiguration::any(),
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()
@@ -2536,7 +2601,11 @@ mod tests {
             .with(eq(quote_id), eq(quote_search_parameters.clone()))
             .returning(move |_, _| Ok(quote_data.clone()));
 
+        let mut bad_token_detector = MockBadTokenDetecting::new();
         let mut balance_fetcher = MockBalanceFetching::new();
+        bad_token_detector
+            .expect_detect()
+            .returning(|_| Ok(TokenQuality::Good));
         balance_fetcher
             .expect_can_transfer()
             .returning(|_, _| Ok(()));
@@ -2546,7 +2615,7 @@ mod tests {
             .expect_validate_signature_and_get_additional_gas()
             .returning(|_| Ok(default_verification_gas_limit()));
         let mut limit_order_counter = MockLimitOrderCounting::new();
-        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().alloy);
         limit_order_counter.expect_count().returning(|_| Ok(0u64));
         let validator = OrderValidator::new(
             native_token,
@@ -2557,7 +2626,7 @@ mod tests {
                 max_limit: Duration::from_secs(200),
             },
             false,
-            Default::default(),
+            Arc::new(bad_token_detector),
             HooksTrampoline::Instance::new(
                 Address::from([0xcf; 20]),
                 ProviderBuilder::new()

@@ -151,7 +151,7 @@ mod tests {
             providers::{Provider, ProviderBuilder, mock::Asserter},
             sol_types::SolCall,
         },
-        ethrpc::Web3,
+        ethrpc::{Web3, mock::MockTransport},
         futures::future,
         maplit::btreemap,
     };
@@ -279,10 +279,10 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&10);
-        let web3 = Web3::with_asserter(asserter);
+        let web3 = Web3::<MockTransport>::with_asserter(asserter);
 
         let factory =
-            BalancerV2WeightedPoolFactory::Instance::new(Address::default(), web3.provider.clone());
+            BalancerV2WeightedPoolFactory::Instance::new(Address::default(), web3.alloy.clone());
         let pool_info = PoolInfo {
             common: common::PoolInfo {
                 id: B256::repeat_byte(0x90),
@@ -300,7 +300,7 @@ mod tests {
         };
 
         let pool_state = {
-            let block = web3.provider.get_block_number().await.unwrap();
+            let block = web3.alloy.get_block_number().await.unwrap();
 
             let pool_state = factory.fetch_pool_state(
                 &pool_info,

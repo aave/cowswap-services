@@ -47,50 +47,48 @@ pub struct Contracts {
 impl Contracts {
     pub async fn deployed_with(web3: &Web3, deployed: DeployedContracts) -> Self {
         let network_id = web3
-            .provider
+            .alloy
             .get_chain_id()
             .await
             .expect("get network ID failed")
             .to_string();
         tracing::info!("connected to forked test network {}", network_id);
 
-        let gp_settlement = GPv2Settlement::Instance::deployed(&web3.provider)
+        let gp_settlement = GPv2Settlement::Instance::deployed(&web3.alloy)
             .await
             .unwrap();
         let balances = match deployed.balances {
-            Some(address) => Balances::Instance::new(address, web3.provider.clone()),
-            None => Balances::Instance::deployed(&web3.provider)
+            Some(address) => Balances::Instance::new(address, web3.alloy.clone()),
+            None => Balances::Instance::deployed(&web3.alloy)
                 .await
                 .expect("failed to find balances contract"),
         };
         let signatures = match deployed.signatures {
-            Some(address) => Signatures::Instance::new(address, web3.provider.clone()),
-            None => Signatures::Instance::deployed(&web3.provider)
+            Some(address) => Signatures::Instance::new(address, web3.alloy.clone()),
+            None => Signatures::Instance::deployed(&web3.alloy)
                 .await
                 .expect("failed to find signatures contract"),
         };
 
-        let flashloan_router = FlashLoanRouter::Instance::deployed(&web3.provider)
-            .await
-            .ok();
+        let flashloan_router = FlashLoanRouter::Instance::deployed(&web3.alloy).await.ok();
 
         Self {
             chain_id: network_id
                 .parse()
                 .expect("Couldn't parse network ID to u64"),
-            balancer_vault: BalancerV2Vault::Instance::deployed(&web3.provider)
+            balancer_vault: BalancerV2Vault::Instance::deployed(&web3.alloy)
                 .await
                 .unwrap(),
-            gp_authenticator: GPv2AllowListAuthentication::Instance::deployed(&web3.provider)
+            gp_authenticator: GPv2AllowListAuthentication::Instance::deployed(&web3.alloy)
                 .await
                 .unwrap(),
-            uniswap_v2_factory: UniswapV2Factory::Instance::deployed(&web3.provider)
+            uniswap_v2_factory: UniswapV2Factory::Instance::deployed(&web3.alloy)
                 .await
                 .unwrap(),
-            uniswap_v2_router: UniswapV2Router02::Instance::deployed(&web3.provider)
+            uniswap_v2_router: UniswapV2Router02::Instance::deployed(&web3.alloy)
                 .await
                 .unwrap(),
-            weth: WETH9::Instance::deployed(&web3.provider).await.unwrap(),
+            weth: WETH9::Instance::deployed(&web3.alloy).await.unwrap(),
             allowance: gp_settlement
                 .vaultRelayer()
                 .call()
@@ -105,11 +103,11 @@ impl Contracts {
                     .0,
             ),
             ethflows: vec![
-                CoWSwapEthFlow::Instance::deployed(&web3.provider)
+                CoWSwapEthFlow::Instance::deployed(&web3.alloy)
                     .await
                     .unwrap(),
             ],
-            hooks: HooksTrampoline::Instance::deployed(&web3.provider)
+            hooks: HooksTrampoline::Instance::deployed(&web3.alloy)
                 .await
                 .unwrap(),
             gp_settlement,
@@ -121,7 +119,7 @@ impl Contracts {
 
     pub async fn deploy(web3: &Web3) -> Self {
         let network_id = web3
-            .provider
+            .alloy
             .get_chain_id()
             .await
             .expect("get network ID failed")
@@ -129,22 +127,19 @@ impl Contracts {
         tracing::info!("connected to test network {}", network_id);
 
         let accounts = web3
-            .provider
+            .alloy
             .get_accounts()
             .await
             .expect("get accounts failed");
         let admin = accounts[0];
 
-        let weth = WETH9::Instance::deploy(web3.provider.clone())
+        let weth = WETH9::Instance::deploy(web3.alloy.clone()).await.unwrap();
+
+        let balancer_authorizer = BalancerV2Authorizer::Instance::deploy(web3.alloy.clone(), admin)
             .await
             .unwrap();
-
-        let balancer_authorizer =
-            BalancerV2Authorizer::Instance::deploy(web3.provider.clone(), admin)
-                .await
-                .unwrap();
         let balancer_vault = BalancerV2Vault::Instance::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *balancer_authorizer.address(),
             *weth.address(),
             U256::ZERO,
@@ -153,18 +148,18 @@ impl Contracts {
         .await
         .unwrap();
 
-        let uniswap_v2_factory = UniswapV2Factory::Instance::deploy(web3.provider.clone(), admin)
+        let uniswap_v2_factory = UniswapV2Factory::Instance::deploy(web3.alloy.clone(), admin)
             .await
             .unwrap();
         let uniswap_v2_router = UniswapV2Router02::Instance::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *uniswap_v2_factory.address(),
             *weth.address(),
         )
         .await
         .unwrap();
 
-        let gp_authenticator = GPv2AllowListAuthentication::Instance::deploy(web3.provider.clone())
+        let gp_authenticator = GPv2AllowListAuthentication::Instance::deploy(web3.alloy.clone())
             .await
             .unwrap();
         gp_authenticator
@@ -173,16 +168,16 @@ impl Contracts {
             .await
             .expect("failed to initialize manager");
         let gp_settlement = GPv2Settlement::Instance::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *gp_authenticator.address(),
             *balancer_vault.address(),
         )
         .await
         .unwrap();
-        let balances = Balances::Instance::deploy(web3.provider.clone())
+        let balances = Balances::Instance::deploy(web3.alloy.clone())
             .await
             .unwrap();
-        let signatures = Signatures::Instance::deploy(web3.provider.clone())
+        let signatures = Signatures::Instance::deploy(web3.alloy.clone())
             .await
             .unwrap();
 
@@ -213,25 +208,24 @@ impl Contracts {
         );
 
         let ethflow = CoWSwapEthFlow::Instance::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *gp_settlement.address(),
             *weth.address(),
         )
         .await
         .unwrap();
         let ethflow_secondary = CoWSwapEthFlow::Instance::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *gp_settlement.address(),
             *weth.address(),
         )
         .await
         .unwrap();
-        let hooks =
-            HooksTrampoline::Instance::deploy(web3.provider.clone(), *gp_settlement.address())
-                .await
-                .unwrap();
+        let hooks = HooksTrampoline::Instance::deploy(web3.alloy.clone(), *gp_settlement.address())
+            .await
+            .unwrap();
         let flashloan_router =
-            FlashLoanRouter::Instance::deploy(web3.provider.clone(), *gp_settlement.address())
+            FlashLoanRouter::Instance::deploy(web3.alloy.clone(), *gp_settlement.address())
                 .await
                 .unwrap();
 

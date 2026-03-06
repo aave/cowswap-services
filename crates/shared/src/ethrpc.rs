@@ -1,10 +1,11 @@
-pub use ethrpc::Web3;
+pub use ethrpc::{Web3, Web3Transport};
 use {
+    crate::http_client::HttpClientFactory,
+    reqwest::Url,
     std::{
         fmt::{self, Display, Formatter},
         time::Duration,
     },
-    url::Url,
 };
 
 pub const MAX_BATCH_SIZE: usize = 100;
@@ -58,8 +59,13 @@ impl Arguments {
     }
 }
 
-/// Create a Web3 instance with a label for observability.
-pub fn web3(args: &Arguments, url: &Url, name: impl ToString) -> Web3 {
-    let label = name.to_string();
-    ethrpc::web3(args.ethrpc(), url, Some(&label))
+/// Create a Web3 instance.
+pub fn web3(
+    args: &Arguments,
+    http_factory: &HttpClientFactory,
+    url: &Url,
+    name: impl ToString,
+) -> Web3 {
+    let http_builder = http_factory.builder();
+    ethrpc::web3(args.ethrpc(), http_builder, url, name)
 }

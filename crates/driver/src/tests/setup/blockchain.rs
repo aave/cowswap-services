@@ -254,10 +254,10 @@ impl Blockchain {
         web3.wallet.register_signer(primary_account);
 
         // Use the primary account to fund the trader, cow amm and the solver with ETH.
-        let balance = web3.provider.get_balance(primary_address).await.unwrap();
+        let balance = web3.alloy.get_balance(primary_address).await.unwrap();
         wait_for(
             &web3,
-            web3.provider.send_and_watch(
+            web3.alloy.send_and_watch(
                 TransactionRequest::default()
                     .from(primary_address)
                     .to(main_trader_address)
@@ -267,15 +267,15 @@ impl Blockchain {
         .await
         .unwrap();
 
-        let weth = contracts::alloy::WETH9::Instance::deploy_builder(web3.provider.clone())
+        let weth = contracts::alloy::WETH9::Instance::deploy_builder(web3.alloy.clone())
             .from(main_trader_address)
             .deploy()
             .await
             .unwrap();
-        let weth = WETH9::WETH9::new(weth, web3.provider.clone());
+        let weth = WETH9::WETH9::new(weth, web3.alloy.clone());
         wait_for(
             &web3,
-            web3.provider.send_and_watch(
+            web3.alloy.send_and_watch(
                 TransactionRequest::default()
                     .from(primary_address)
                     .to(*weth.address())
@@ -286,16 +286,14 @@ impl Blockchain {
         .unwrap();
 
         // Set up the settlement contract and related contracts.
-        let vault_authorizer = BalancerV2Authorizer::Instance::deploy_builder(
-            web3.provider.clone(),
-            main_trader_address,
-        )
-        .from(main_trader_address)
-        .deploy()
-        .await
-        .unwrap();
+        let vault_authorizer =
+            BalancerV2Authorizer::Instance::deploy_builder(web3.alloy.clone(), main_trader_address)
+                .from(main_trader_address)
+                .deploy()
+                .await
+                .unwrap();
         let vault = BalancerV2Vault::Instance::deploy_builder(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             vault_authorizer,
             *weth.address(),
             alloy::primitives::U256::ZERO,
@@ -305,11 +303,11 @@ impl Blockchain {
         .deploy()
         .await
         .unwrap();
-        let authenticator = GPv2AllowListAuthentication::deploy(web3.provider.clone())
+        let authenticator = GPv2AllowListAuthentication::deploy(web3.alloy.clone())
             .await
             .unwrap();
         let mut settlement = GPv2Settlement::GPv2Settlement::deploy(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             *authenticator.address(),
             vault,
         )
@@ -321,7 +319,7 @@ impl Blockchain {
                 // replace the vault relayer code to allow the settlement
                 // contract at a specific address.
                 let mut code = web3
-                    .provider
+                    .alloy
                     .get_code_at(vault_relayer)
                     .await
                     .unwrap()
@@ -335,35 +333,31 @@ impl Blockchain {
                 }
                 code
             };
-            web3.provider
+            web3.alloy
                 .anvil_set_code(vault_relayer, vault_relayer_code.into())
                 .await
                 .unwrap();
 
             // Note: (settlement.address() == authenticator_address) != settlement_address
-            let settlement_code = web3
-                .provider
-                .get_code_at(*settlement.address())
-                .await
-                .unwrap();
-            web3.provider
+            let settlement_code = web3.alloy.get_code_at(*settlement.address()).await.unwrap();
+            web3.alloy
                 .anvil_set_code(settlement_address, settlement_code)
                 .await
                 .unwrap();
 
             settlement =
-                GPv2Settlement::GPv2Settlement::new(settlement_address, web3.provider.clone());
+                GPv2Settlement::GPv2Settlement::new(settlement_address, web3.alloy.clone());
         }
 
         let balances_address = match config.balances_address {
             Some(balances_address) => balances_address,
-            None => Balances::Instance::deploy_builder(web3.provider.clone())
+            None => Balances::Instance::deploy_builder(web3.alloy.clone())
                 .from(main_trader_address)
                 .deploy()
                 .await
                 .unwrap(),
         };
-        let balances = Balances::Instance::new(balances_address, web3.provider.clone());
+        let balances = Balances::Instance::new(balances_address, web3.alloy.clone());
 
         authenticator
             .initializeManager(main_trader_address)
@@ -375,22 +369,22 @@ impl Blockchain {
         let signatures_address = if let Some(signatures_address) = config.signatures_address {
             signatures_address
         } else {
-            Signatures::Instance::deploy_builder(web3.provider.clone())
+            Signatures::Instance::deploy_builder(web3.alloy.clone())
                 .from(main_trader_address)
                 .deploy()
                 .await
                 .unwrap()
         };
-        let signatures = Signatures::Instance::new(signatures_address, web3.provider.clone());
+        let signatures = Signatures::Instance::new(signatures_address, web3.alloy.clone());
 
         let flashloan_router_address =
-            FlashLoanRouter::Instance::deploy_builder(web3.provider.clone(), *settlement.address())
+            FlashLoanRouter::Instance::deploy_builder(web3.alloy.clone(), *settlement.address())
                 .from(main_trader_address)
                 .deploy()
                 .await
                 .unwrap();
         let flashloan_router =
-            FlashLoanRouter::Instance::new(flashloan_router_address, web3.provider.clone());
+            FlashLoanRouter::Instance::new(flashloan_router_address, web3.alloy.clone());
 
         let mut trader_addresses: Vec<Address> = Vec::new();
         for config in config.solvers {
@@ -402,7 +396,7 @@ impl Blockchain {
                 .unwrap();
             wait_for(
                 &web3,
-                web3.provider.send_and_watch(
+                web3.alloy.send_and_watch(
                     TransactionRequest::default()
                         .from(primary_address)
                         .to(config.address())
@@ -425,13 +419,13 @@ impl Blockchain {
         let mut tokens = HashMap::new();
         for pool in config.pools.iter() {
             if pool.reserve_a.token != "WETH" && !tokens.contains_key(pool.reserve_a.token) {
-                let token = ERC20Mintable::Instance::deploy(web3.provider.clone())
+                let token = ERC20Mintable::Instance::deploy(web3.alloy.clone())
                     .await
                     .unwrap();
                 tokens.insert(pool.reserve_a.token, token);
             }
             if pool.reserve_b.token != "WETH" && !tokens.contains_key(pool.reserve_b.token) {
-                let token = ERC20Mintable::Instance::deploy(web3.provider.clone())
+                let token = ERC20Mintable::Instance::deploy(web3.alloy.clone())
                     .await
                     .unwrap();
                 tokens.insert(pool.reserve_b.token, token);
@@ -439,17 +433,15 @@ impl Blockchain {
         }
         // Create the uniswap factory.
         let contract_address = contracts::alloy::UniswapV2Factory::Instance::deploy_builder(
-            web3.provider.clone(),
+            web3.alloy.clone(),
             main_trader_address,
         )
         .from(main_trader_address)
         .deploy()
         .await
         .unwrap();
-        let uniswap_factory = contracts::alloy::UniswapV2Factory::Instance::new(
-            contract_address,
-            web3.provider.clone(),
-        );
+        let uniswap_factory =
+            contracts::alloy::UniswapV2Factory::Instance::new(contract_address, web3.alloy.clone());
         // Create and fund a uniswap pair for each pool. Fund the settlement contract
         // with the same liquidity as the pool, to allow for internalized interactions.
         let mut pairs = Vec::new();
@@ -479,7 +471,7 @@ impl Blockchain {
                     .call()
                     .await
                     .unwrap(),
-                web3.provider.clone(),
+                web3.alloy.clone(),
             );
             pairs.push(Pair {
                 token_a: pool.reserve_a.token,
@@ -737,11 +729,11 @@ impl Blockchain {
             // Find the pair to use for this order and calculate the buy and sell amounts.
             let sell_token = ERC20::Instance::new(
                 self.get_token_wrapped(order.sell_token),
-                self.web3.provider.clone(),
+                self.web3.alloy.clone(),
             );
             let buy_token = ERC20::Instance::new(
                 self.get_token_wrapped(order.buy_token),
-                self.web3.provider.clone(),
+                self.web3.alloy.clone(),
             );
             let pair = self.find_pair(order);
             let execution = self.execution(order);
@@ -867,7 +859,7 @@ impl Blockchain {
     }
 
     pub async fn set_auto_mining(&self, enabled: bool) {
-        self.web3.provider.evm_set_automine(enabled).await.unwrap();
+        self.web3.alloy.evm_set_automine(enabled).await.unwrap();
     }
 }
 
@@ -966,7 +958,7 @@ impl Drop for Node {
 /// wait for transactions to be confirmed before proceeding with the test. When
 /// switching from geth back to hardhat, this function can be removed.
 pub async fn wait_for<T>(web3: &Web3, fut: impl Future<Output = T>) -> T {
-    let block = web3.provider.get_block_number().await.unwrap();
+    let block = web3.alloy.get_block_number().await.unwrap();
     let result = fut.await;
     wait_for_block(web3, block + 1).await;
     result
@@ -976,7 +968,7 @@ pub async fn wait_for<T>(web3: &Web3, fut: impl Future<Output = T>) -> T {
 pub async fn wait_for_block(web3: &Web3, block: u64) {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         loop {
-            let next_block = web3.provider.get_block_number().await.unwrap();
+            let next_block = web3.alloy.get_block_number().await.unwrap();
             if next_block >= block {
                 break;
             }

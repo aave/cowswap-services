@@ -39,14 +39,6 @@ servers:
     url: "https://api.cow.fi/bnb"
   - description: BNB (Staging)
     url: "https://barn.api.cow.fi/bnb"
-  - description: Plasma (Prod)
-    url: "https://api.cow.fi/plasma"
-  - description: Plasma (Staging)
-    url: "https://barn.api.cow.fi/plasma"
-  - description: Ink (Prod)
-    url: "https://api.cow.fi/ink"
-  - description: Ink (Staging)
-    url: "https://barn.api.cow.fi/ink"
   - description: Sepolia (Prod)
     url: "https://api.cow.fi/sepolia"
   - description: Sepolia (Staging)
@@ -85,8 +77,6 @@ paths:
           description: "Forbidden, your account is deny-listed."
         "404":
           description: No route was found quoting the order.
-        "422":
-          description: Unable to parse request body as valid JSON.
         "429":
           description: Too many order placements.
         "500":
@@ -127,8 +117,6 @@ paths:
           description: Invalid signature.
         "404":
           description: One or more orders were not found and no orders were cancelled.
-        "422":
-          description: Unable to parse request body as valid JSON.
   "/api/v1/orders/{UID}":
     get:
       operationId: getOrder
@@ -185,8 +173,6 @@ paths:
           description: Invalid signature.
         "404":
           description: Order was not found.
-        "422":
-          description: Unable to parse request body as valid JSON.
   "/api/v1/orders/{UID}/status":
     get:
       operationId: getOrderStatus
@@ -447,8 +433,6 @@ paths:
                 $ref: "#/components/schemas/PriceEstimationError"
         "404":
           description: No route was found for the specified order.
-        "422":
-          description: Unable to parse request body as valid JSON.
         "429":
           description: Too many order quotes.
         "500":
@@ -638,8 +622,6 @@ paths:
                 $ref: "#/components/schemas/AppDataHash"
         "400":
           description: Error validating full `appData`
-        "422":
-          description: Unable to parse request body as valid JSON.
         "500":
           description: Error storing the full `appData`
   /api/v1/app_data:
@@ -671,8 +653,6 @@ paths:
                 $ref: "#/components/schemas/AppDataHash"
         "400":
           description: Error validating full `appData`
-        "422":
-          description: Unable to parse request body as valid JSON.
         "500":
           description: Error storing the full `appData`
   "/api/v1/users/{address}/total_surplus":
@@ -1659,9 +1639,7 @@ components:
             - UnsupportedToken
             - InvalidAppData
             - AppDataHashMismatch
-            - AppDataMismatch
             - AppdataFromMismatch
-            - MetadataSerializationFailed
             - OldOrderActivelyBidOn
         description:
           type: string
@@ -1694,7 +1672,7 @@ components:
           enum:
             - QuoteNotVerified
             - UnsupportedToken
-            - NoLiquidity
+            - ZeroAmount
             - UnsupportedOrderType
         description:
           type: string

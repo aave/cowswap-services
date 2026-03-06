@@ -83,7 +83,17 @@ async fn get_native_price(
 
     let start = Instant::now();
     match state.estimator.estimate_native_price(token, timeout).await {
-        Ok(price) => Json(NativeTokenPrice { price }).into_response(),
+        Ok(price) => {
+            let elapsed = start.elapsed();
+            tracing::debug!(
+                ?token,
+                ?timeout,
+                ?elapsed,
+                ?price,
+                "estimated native token price"
+            );
+            Json(NativeTokenPrice { price }).into_response()
+        }
         Err(err) => {
             let elapsed = start.elapsed();
             tracing::warn!(

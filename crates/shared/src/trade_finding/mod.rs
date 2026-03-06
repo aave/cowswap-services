@@ -30,12 +30,11 @@ pub trait TradeFinding: Send + Sync + 'static {
 }
 
 /// A quote.
-#[derive(Clone, derive_more::Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Quote {
     pub out_amount: U256,
     pub gas_estimate: u64,
     pub solver: Address,
-    #[debug(ignore)]
     pub execution: QuoteExecution,
 }
 
@@ -96,32 +95,24 @@ impl TradeKind {
         }
     }
 
-    /// Returns whether the solution contains anything that could
-    /// actually produce the promised buy tokens.
-    pub fn has_execution_plan(&self) -> bool {
-        self.interactions().next().is_some()
-            || self.jit_orders().next().is_some()
-            || self.pre_interactions().next().is_some()
-    }
-
-    pub fn interactions(&self) -> impl std::iter::Iterator<Item = &Interaction> {
+    pub fn interactions(&self) -> Vec<Interaction> {
         match self {
-            TradeKind::Legacy(trade) => trade.interactions.iter(),
-            TradeKind::Regular(trade) => trade.interactions.iter(),
+            TradeKind::Legacy(trade) => trade.interactions.clone(),
+            TradeKind::Regular(trade) => trade.interactions.clone(),
         }
     }
 
-    pub fn pre_interactions(&self) -> impl std::iter::Iterator<Item = &Interaction> {
+    pub fn pre_interactions(&self) -> Vec<Interaction> {
         match self {
-            TradeKind::Legacy(_) => [].iter(),
-            TradeKind::Regular(trade) => trade.pre_interactions.iter(),
+            TradeKind::Legacy(_) => Vec::new(),
+            TradeKind::Regular(trade) => trade.pre_interactions.clone(),
         }
     }
 
-    pub fn jit_orders(&self) -> impl std::iter::Iterator<Item = &dto::JitOrder> {
+    pub fn jit_orders(&self) -> Vec<dto::JitOrder> {
         match self {
-            TradeKind::Legacy(_) => [].iter(),
-            TradeKind::Regular(trade) => trade.jit_orders.iter(),
+            TradeKind::Legacy(_) => Vec::new(),
+            TradeKind::Regular(trade) => trade.jit_orders.clone(),
         }
     }
 }
@@ -290,11 +281,9 @@ pub fn map_interactions(interactions: &[InteractionData]) -> Vec<Interaction> {
     interactions.iter().cloned().map(Into::into).collect()
 }
 
-pub fn map_interactions_data<'a>(
-    interactions: impl IntoIterator<Item = &'a Interaction>,
-) -> Vec<InteractionData> {
+pub fn map_interactions_data(interactions: &[Interaction]) -> Vec<InteractionData> {
     interactions
-        .into_iter()
+        .iter()
         .map(|i| i.to_interaction_data())
         .collect()
 }

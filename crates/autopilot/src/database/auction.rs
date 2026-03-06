@@ -11,7 +11,7 @@ use {
         event_storing_helpers::{create_db_search_parameters, create_quote_row},
         order_quoting::{QuoteData, QuoteSearchParameters, QuoteStoring},
     },
-    std::{collections::HashMap, ops::DerefMut, sync::Arc},
+    std::{collections::HashMap, ops::DerefMut},
 };
 
 #[async_trait::async_trait]
@@ -75,11 +75,11 @@ impl Postgres {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
             .execute(ex.deref_mut())
             .await?;
-        let orders: HashMap<domain::OrderUid, Arc<Order>> =
+        let orders: HashMap<domain::OrderUid, Order> =
             database::orders::solvable_orders(&mut ex, i64::from(min_valid_to))
                 .map(|result| match result {
                     Ok(order) => full_order_into_model_order(order)
-                        .map(|order| (domain::OrderUid(order.metadata.uid.0), Arc::new(order))),
+                        .map(|order| (domain::OrderUid(order.metadata.uid.0), order)),
                     Err(err) => Err(anyhow::Error::from(err)),
                 })
                 .try_collect()
@@ -88,12 +88,7 @@ impl Postgres {
             .await?
             .to_u64()
             .context("latest_settlement_block is not u64")?;
-        let quotes = self
-            .read_quotes(orders.keys())
-            .await?
-            .into_iter()
-            .map(|(uid, quote)| (uid, Arc::new(quote)))
-            .collect();
+        let quotes = self.read_quotes(orders.keys()).await?;
         Ok(boundary::SolvableOrders {
             orders,
             quotes,

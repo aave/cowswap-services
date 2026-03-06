@@ -20,7 +20,6 @@ use {
     number::testing::ApproxEq,
     serde_json::{Value, json},
     serde_with::{DisplayFromStr, serde_as},
-    shared::gas_price_estimation::Eip1559EstimationExt,
     solvers_dto::auction::FlashloanHint,
     std::{
         collections::{HashMap, HashSet},
@@ -412,7 +411,7 @@ impl Solver {
             .flat_map(|f| {
                 let build_token = |token_name: String| async move {
                     let token = config.blockchain.get_token_wrapped(token_name.as_str());
-                    let contract = ERC20::Instance::new(token, config.blockchain.web3.provider.clone());
+                    let contract = ERC20::Instance::new(token, config.blockchain.web3.alloy.clone());
                     let settlement = config.blockchain.settlement.address();
                     (
                         token.encode_hex_with_prefix(),
@@ -489,8 +488,14 @@ impl Solver {
             axum::routing::post(
                 move |axum::extract::State(state): axum::extract::State<State>,
                  axum::extract::Json(req): axum::extract::Json<serde_json::Value>| async move {
-                    let base_fee = eth.current_block().borrow().base_fee;
-                    let effective_gas_price = eth.gas_price().await.unwrap().effective(base_fee).to_string();
+                    let effective_gas_price = eth
+                        .gas_price()
+                        .await
+                        .unwrap()
+                        .effective()
+                        .0
+                        .0
+                        .to_string();
                     let expected = json!({
                         "id": (!config.quote).then_some("1"),
                         "tokens": tokens_json,
@@ -553,10 +558,11 @@ fn check_solve_request(request: Value, expected: Value) {
         request.rest, expected.rest,
         "/solve request body does not match expectation"
     );
+
     assert!(
         request
             .effective_gas_price
-            .is_approx_eq(&expected.effective_gas_price, Some(1.0)), // 1.0%
+            .is_approx_eq(&expected.effective_gas_price, Some(15.0)),
     );
 }
 

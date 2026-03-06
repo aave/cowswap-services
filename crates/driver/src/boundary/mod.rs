@@ -56,5 +56,9 @@ fn web3_client(ethrpc: &Url, max_batch_size: usize, max_concurrent_requests: usi
         ethrpc_max_concurrent_requests: max_concurrent_requests,
         ethrpc_batch_delay: Default::default(),
     };
-    shared::ethrpc::web3(&ethrpc_args, ethrpc, "base")
+    let http_factory =
+        shared::http_client::HttpClientFactory::new(&shared::http_client::Arguments {
+            http_timeout: std::time::Duration::from_secs(10),
+        });
+    shared::ethrpc::web3(&ethrpc_args, &http_factory, ethrpc, "base")
 }

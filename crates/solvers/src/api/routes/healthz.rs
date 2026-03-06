@@ -1,8 +1,5 @@
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::{http::StatusCode, response::IntoResponse};
 
-pub async fn healthz() -> Response {
-    StatusCode::OK.into_response()
+pub async fn healthz() -> impl IntoResponse {
+    StatusCode::OK
 }
