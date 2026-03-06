@@ -9,9 +9,9 @@
 //! trait to conveniently create a new `Provider` with an additional
 //! [`LabelingLayer`].
 use {
-    crate::{Web3, alloy::RpcClientRandomIdExt},
+    crate::alloy::RpcClientRandomIdExt,
     alloy::{
-        providers::{Provider, ProviderBuilder},
+        providers::{DynProvider, Provider, ProviderBuilder},
         rpc::{
             client::RpcClient,
             json_rpc::{RequestPacket, ResponsePacket, SerializedRequest},
@@ -151,29 +151,16 @@ where
 
 pub trait ProviderLabelingExt {
     /// Creates a new provider tagged with another label.
-    fn labeled<S: ToString>(&self, label: S) -> Self;
+    fn labeled(&self, label: String) -> Self;
 }
 
-impl ProviderLabelingExt for Web3 {
-    fn labeled<S: ToString>(&self, label: S) -> Self {
-        let is_local = self.provider.client().is_local();
-        let transport = self.provider.client().transport().clone();
-        let transport_with_label = LabelingLayer {
-            label: label.to_string(),
-        }
-        .layer(transport);
+impl ProviderLabelingExt for DynProvider {
+    fn labeled(&self, label: String) -> Self {
+        let is_local = self.client().is_local();
+        let transport = self.client().transport().clone();
+        let transport_with_label = LabelingLayer { label }.layer(transport);
         let client = RpcClient::with_random_id(transport_with_label, is_local);
-        let alloy = ProviderBuilder::new()
-            .wallet(self.wallet.clone())
-            // TODO: eventually remove this and all the other simple nonce managers
-            .with_simple_nonce_management()
-            .connect_client(client)
-            .erased();
-
-        Self {
-            provider: alloy,
-            wallet: self.wallet.clone(),
-        }
+        ProviderBuilder::new().connect_client(client).erased()
     }
 }
 

@@ -1,27 +1,18 @@
-//! Automated refunder for expired EthFlow orders.
-//!
-//! Monitors EthFlow orders and returns ETH to users whose orders expired
-//! without filling. Runs every 30 seconds: queries database, validates on-chain
-//! status, submits batch refunds.
-//!
-//! Shares PostgreSQL with orderbook (read-only). Refunds tracked via on-chain
-//! events.
-
 pub mod arguments;
-pub mod infra;
 pub mod refund_service;
 pub mod submitter;
-pub mod traits;
 
 // Re-export commonly used types for external consumers (e.g., e2e tests)
-pub use traits::RefundStatus;
+pub use refund_service::RefundStatus;
 use {
     crate::arguments::Arguments,
     alloy::{providers::Provider, signers::local::PrivateKeySigner},
     clap::Parser,
+    contracts::alloy::CoWSwapEthFlow,
     observe::metrics::LivenessChecking,
     refund_service::RefundService,
-    sqlx::postgres::PgPoolOptions,
+    shared::http_client::HttpClientFactory,
+    sqlx::PgPool,
     std::{
         sync::{Arc, RwLock},
         time::{Duration, Instant},
@@ -49,29 +40,11 @@ pub async fn start(args: impl Iterator<Item = String>) {
 }
 
 pub async fn run(args: arguments::Arguments) {
-    // Observability setup
-    let liveness = Arc::new(Liveness {
-        last_successful_loop: RwLock::new(Instant::now()),
-    });
-    observe::metrics::serve_metrics(
-        liveness.clone(),
-        ([0, 0, 0, 0], args.metrics_port).into(),
-        Default::default(),
-        Default::default(),
-    );
-
-    // Database initialization
-    let pg_pool = PgPoolOptions::new()
-        .max_connections(args.database_pool.db_max_connections.get())
-        .connect_lazy(args.db_url.as_str())
-        .expect("failed to create database");
-
-    // Blockchain/RPC setup
-    let web3 = shared::ethrpc::web3(&args.ethrpc, &args.node_url, "base");
-
+    let http_factory = HttpClientFactory::new(&args.http_client);
+    let web3 = shared::ethrpc::web3(&args.ethrpc, &http_factory, &args.node_url, "base");
     if let Some(expected_chain_id) = args.chain_id {
         let chain_id = web3
-            .provider
+            .alloy
             .get_chain_id()
             .await
             .expect("Could not get chainId");
@@ -81,31 +54,42 @@ pub async fn run(args: arguments::Arguments) {
         );
     }
 
-    // Signer configuration
-    let signer = args
-        .refunder_pk
-        .parse::<PrivateKeySigner>()
-        .expect("couldn't parse refunder private key");
+    let pg_pool = PgPool::connect_lazy(args.db_url.as_str()).expect("failed to create database");
 
-    // Service construction
-    let min_validity_duration =
-        i64::try_from(args.min_validity_duration.as_secs()).unwrap_or(i64::MAX);
+    let liveness = Arc::new(Liveness {
+        // Program will be healthy at the start even if no loop was ran yet.
+        last_successful_loop: RwLock::new(Instant::now()),
+    });
+    observe::metrics::serve_metrics(
+        liveness.clone(),
+        ([0, 0, 0, 0], args.metrics_port).into(),
+        Default::default(),
+        Default::default(),
+    );
 
-    let mut refunder = RefundService::from_components(
+    let ethflow_contracts = args
+        .ethflow_contracts
+        .iter()
+        .map(|contract| CoWSwapEthFlow::Instance::new(*contract, web3.alloy.clone()))
+        .collect();
+    let refunder_account = Box::new(
+        args.refunder_pk
+            .parse::<PrivateKeySigner>()
+            .expect("couldn't parse refunder private key"),
+    );
+    let mut refunder = RefundService::new(
         pg_pool,
         web3,
-        args.ethflow_contracts,
-        min_validity_duration,
+        ethflow_contracts,
+        i64::try_from(args.min_validity_duration.as_secs()).unwrap_or(i64::MAX),
         args.min_price_deviation_bps,
-        signer,
+        refunder_account,
         args.max_gas_price,
         args.start_priority_fee_tip,
         Some(args.lookback_time),
     );
-
-    // Main loop
     loop {
-        tracing::info!("Starting a new refunding loop");
+        tracing::info!("Staring a new refunding loop");
         match refunder.try_to_refund_all_eligible_orders().await {
             Ok(_) => {
                 track_refunding_loop_result("success");

@@ -1,1 +1,0 @@
-ALTER TABLE orders ALTER COLUMN true_valid_to SET NOT NULL;

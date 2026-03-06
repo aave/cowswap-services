@@ -1,11 +1,12 @@
 use {
     self::dto::{reveal, settle, solve},
-    crate::{arguments::Account, domain::eth, util},
+    crate::{arguments::Account, domain::eth, infra::solvers::dto::notify, util},
     alloy::signers::{Signer, aws::AwsSigner},
     anyhow::{Context, Result, anyhow},
+    chrono::{DateTime, Utc},
     observe::tracing::tracing_headers,
     reqwest::{Client, StatusCode},
-    std::time::Duration,
+    std::{sync::Arc, time::Duration},
     thiserror::Error,
     tracing::instrument,
     url::Url,
@@ -24,6 +25,7 @@ pub struct Driver {
     // another driver solved with surplus exceeding this driver's surplus by `threshold`
     pub fairness_threshold: Option<eth::Ether>,
     pub submission_address: eth::Address,
+    pub requested_timeout_on_problems: bool,
     client: Client,
 }
 
@@ -42,6 +44,7 @@ impl Driver {
         name: String,
         fairness_threshold: Option<eth::Ether>,
         submission_account: Account,
+        requested_timeout_on_problems: bool,
     ) -> Result<Self, Error> {
         let submission_address = match submission_account {
             Account::Kms(key_id) => {
@@ -75,6 +78,7 @@ impl Driver {
                 .build()
                 .map_err(Error::FailedToBuildClient)?,
             submission_address,
+            requested_timeout_on_problems,
         })
     }
 
@@ -117,6 +121,10 @@ impl Driver {
             return Err(anyhow!("bad status {status}: {text}"));
         }
         Ok(())
+    }
+
+    pub async fn notify(&self, request: notify::Request) -> Result<()> {
+        self.request_response("notify", request).await
     }
 
     async fn request_response<Response, Request>(
@@ -180,4 +188,19 @@ pub async fn response_body_with_size_limit(
         bytes.extend_from_slice(slice);
     }
     Ok(bytes)
+}
+
+/// Notifies the non-settling driver in a fire-and-forget manner.
+pub fn notify_banned_solver(
+    non_settling_driver: Arc<Driver>,
+    reason: notify::BanReason,
+    banned_until: DateTime<Utc>,
+) {
+    let request = notify::Request::Banned {
+        reason,
+        until: banned_until,
+    };
+    tokio::spawn(async move {
+        let _ = non_settling_driver.notify(request).await;
+    });
 }

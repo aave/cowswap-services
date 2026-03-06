@@ -12,12 +12,7 @@
 //! cluster.
 
 use {
-    axum::{
-        Router,
-        body::Body,
-        http::Request,
-        response::{IntoResponse, Response},
-    },
+    axum::{Router, body::Body, http::Request, response::IntoResponse},
     hyper::body::to_bytes,
     std::{collections::VecDeque, net::SocketAddr, sync::Arc},
     tokio::{sync::RwLock, task::JoinHandle},
@@ -114,7 +109,7 @@ async fn handle_request(
     client: reqwest::Client,
     state: ProxyState,
     req: Request<Body>,
-) -> Response {
+) -> impl IntoResponse {
     let (parts, body) = req.into_parts();
 
     // Convert body to bytes once for reuse across retries

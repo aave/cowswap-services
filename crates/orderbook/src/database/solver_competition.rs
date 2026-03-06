@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn not_found_error() {
-        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
+        let db = Postgres::try_new("postgresql://").unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         let result = db

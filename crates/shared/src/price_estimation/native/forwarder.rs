@@ -35,15 +35,14 @@ impl Forwarder {
             .join(format!("native_price/{:?}", token).as_str())
             .context("failed to construct autopilot URL")?;
 
-        let mut request = self
+        let response = self
             .client
             .get(url)
             .query(&[("timeout_ms", timeout.as_millis() as u64)])
-            .timeout(timeout);
-        if let Some(id) = observe::distributed_tracing::request_id::from_current_span() {
-            request = request.header("X-REQUEST-ID", id);
-        }
-        let response = request.send().await.context("failed to send request")?;
+            .timeout(timeout)
+            .send()
+            .await
+            .context("failed to send request")?;
 
         match response.status() {
             StatusCode::OK => {

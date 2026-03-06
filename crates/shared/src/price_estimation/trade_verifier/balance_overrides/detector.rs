@@ -134,7 +134,7 @@ impl Detector {
 
         let trace = self
             .web3
-            .provider
+            .alloy
             .debug_trace_call(
                 call_request,
                 BlockId::latest(),
@@ -293,7 +293,7 @@ impl Detector {
         let overrides = strategy.state_override(&holder, &test_balance);
 
         // Call balanceOf with the override
-        let token_contract = ERC20::Instance::new(token, self.web3.provider.clone());
+        let token_contract = ERC20::Instance::new(token, self.web3.alloy.clone());
         let balance = token_contract
             .balanceOf(holder)
             .state(overrides)

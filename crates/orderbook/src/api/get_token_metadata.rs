@@ -1,30 +1,31 @@
 use {
-    crate::api::AppState,
+    crate::database::Postgres,
     alloy::primitives::Address,
-    axum::{
-        extract::{Path, State},
-        http::StatusCode,
-        response::{IntoResponse, Json, Response},
-    },
-    std::{str::FromStr, sync::Arc},
+    hyper::StatusCode,
+    std::convert::Infallible,
+    warp::{Filter, Rejection, reply},
 };
 
-pub async fn get_token_metadata_handler(
-    State(state): State<Arc<AppState>>,
-    Path(token): Path<String>,
-) -> Response {
-    // TODO: remove after all downstream callers have been notified of the status
-    // code changes
-    let Ok(token) = Address::from_str(&token) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+fn get_native_prices_request() -> impl Filter<Extract = (Address,), Error = Rejection> + Clone {
+    warp::path!("v1" / "token" / Address / "metadata").and(warp::get())
+}
 
-    let result = state.database_read.token_metadata(&token).await;
-    match result {
-        Ok(metadata) => Json(metadata).into_response(),
-        Err(err) => {
-            tracing::error!(?err, ?token, "Failed to fetch token's first trade block");
-            crate::api::internal_error_reply()
+pub fn get_token_metadata(
+    db: Postgres,
+) -> impl Filter<Extract = (super::ApiReply,), Error = Rejection> + Clone {
+    get_native_prices_request().and_then(move |token: Address| {
+        let db = db.clone();
+        async move {
+            let result = db.token_metadata(&token).await;
+            let response = match result {
+                Ok(metadata) => reply::with_status(reply::json(&metadata), StatusCode::OK),
+                Err(err) => {
+                    tracing::error!(?err, ?token, "Failed to fetch token's first trade block");
+                    crate::api::internal_error_reply()
+                }
+            };
+
+            Result::<_, Infallible>::Ok(response)
         }
-    }
+    })
 }

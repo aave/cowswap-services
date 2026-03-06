@@ -1,6 +1,6 @@
 use {
     crate::{
-        bad_token::list_based::DenyListedTokens,
+        bad_token::{BadTokenDetecting, TokenQuality},
         price_estimation::{
             Estimate,
             PriceEstimating,
@@ -21,7 +21,7 @@ use {
 /// ETH as buy token appropriately.
 pub struct SanitizedPriceEstimator {
     inner: Arc<dyn PriceEstimating>,
-    deny_listed_tokens: DenyListedTokens,
+    bad_token_detector: Arc<dyn BadTokenDetecting>,
     native_token: Address,
     /// Enables the short-circuiting logic in case the sell and buy tokens are
     /// the same
@@ -32,25 +32,26 @@ impl SanitizedPriceEstimator {
     pub fn new(
         inner: Arc<dyn PriceEstimating>,
         native_token: Address,
-        deny_listed_tokens: DenyListedTokens,
+        bad_token_detector: Arc<dyn BadTokenDetecting>,
         is_estimating_native_price: bool,
     ) -> Self {
         Self {
             inner,
             native_token,
-            deny_listed_tokens,
+            bad_token_detector,
             is_estimating_native_price,
         }
     }
 
     /// Checks if the traded tokens are supported by the protocol.
-    fn handle_deny_listed_tokens(&self, query: &Query) -> Result<(), PriceEstimationError> {
+    async fn handle_bad_tokens(&self, query: &Query) -> Result<(), PriceEstimationError> {
         for token in [query.sell_token, query.buy_token] {
-            if self.deny_listed_tokens.contains(&token) {
-                return Err(PriceEstimationError::UnsupportedToken {
-                    token,
-                    reason: "token is deny listed".to_string(),
-                });
+            match self.bad_token_detector.detect(token).await {
+                Err(err) => return Err(PriceEstimationError::ProtocolInternal(err)),
+                Ok(TokenQuality::Bad { reason }) => {
+                    return Err(PriceEstimationError::UnsupportedToken { token, reason });
+                }
+                _ => (),
             }
         }
         Ok(())
@@ -64,7 +65,7 @@ impl PriceEstimating for SanitizedPriceEstimator {
         query: Arc<Query>,
     ) -> futures::future::BoxFuture<'_, super::PriceEstimateResult> {
         async move {
-            self.handle_deny_listed_tokens(&query)?;
+            self.handle_bad_tokens(&query).await?;
             // When estimating native price the sell token is substituted by
             // native one. In that case, the output amount of the price
             // estimation can be trivially computed as the same amount as input
@@ -152,7 +153,10 @@ impl PriceEstimating for SanitizedPriceEstimator {
 mod tests {
     use {
         super::*,
-        crate::price_estimation::{HEALTHY_PRICE_ESTIMATION_TIME, MockPriceEstimating},
+        crate::{
+            bad_token::{MockBadTokenDetecting, TokenQuality},
+            price_estimation::{HEALTHY_PRICE_ESTIMATION_TIME, MockPriceEstimating},
+        },
         alloy::primitives::{Address, U256 as AlloyU256},
         model::order::OrderKind,
         number::nonzero::NonZeroU256,
@@ -162,7 +166,16 @@ mod tests {
 
     #[tokio::test]
     async fn handles_trivial_estimates_on_its_own() {
-        let deny_listed_tokens = DenyListedTokens::new(vec![BAD_TOKEN]);
+        let mut bad_token_detector = MockBadTokenDetecting::new();
+        bad_token_detector.expect_detect().returning(|token| {
+            if token == BAD_TOKEN {
+                Ok(TokenQuality::Bad {
+                    reason: "Token not supported".into(),
+                })
+            } else {
+                Ok(TokenQuality::Good)
+            }
+        });
 
         let native_token = Address::with_last_byte(42);
 
@@ -444,9 +457,10 @@ mod tests {
                 }
                 .boxed()
             });
+        let bad_token_detector = Arc::new(bad_token_detector);
         let sanitized_estimator = SanitizedPriceEstimator {
             inner: Arc::new(wrapped_estimator),
-            deny_listed_tokens: deny_listed_tokens.clone(),
+            bad_token_detector: bad_token_detector.clone(),
             native_token,
             is_estimating_native_price: true,
         };
@@ -549,7 +563,7 @@ mod tests {
 
         let sanitized_estimator_non_native = SanitizedPriceEstimator {
             inner: Arc::new(wrapped_estimator),
-            deny_listed_tokens,
+            bad_token_detector,
             native_token,
             is_estimating_native_price: false,
         };

@@ -328,13 +328,11 @@ impl JitOrder {
 
         let signer = signature
             .to_boundary_signature()
-            .and_then(|sig| {
-                sig.recover_owner(
-                    self.0.signature.as_slice(),
-                    &DomainSeparator(domain_separator.0),
-                    &self.raw_order_data().hash_struct(),
-                )
-            })
+            .recover_owner(
+                self.0.signature.as_slice(),
+                &DomainSeparator(domain_separator.0),
+                &self.raw_order_data().hash_struct(),
+            )
             .map_err(|e| super::Error(e.to_string()))?;
 
         if matches!(
