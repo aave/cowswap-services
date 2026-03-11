@@ -1,10 +1,6 @@
 use {
-    super::serialize,
-    alloy::{
-        primitives::{Address, B256, U256},
-        rpc::types::AccessList,
-    },
-    chrono::{DateTime, Utc},
+    alloy_primitives::{Address, B256, U256},
+    alloy_rpc_types_eth::AccessList,
     number::serialization::HexOrDecimalU256,
     serde::{Deserialize, Serialize},
     serde_with::{DisplayFromStr, serde_as},
@@ -69,10 +65,6 @@ pub enum Kind {
     Expired,
     Fail,
     PostprocessingTimedOut,
-    Banned {
-        reason: BanReason,
-        until: DateTime<Utc>,
-    },
     DeserializationError {
         reason: String,
     },
@@ -86,16 +78,9 @@ type BlockNo = u64;
 pub struct Tx {
     pub from: Address,
     pub to: Address,
-    #[serde_as(as = "serialize::Hex")]
+    #[serde_as(as = "serde_ext::Hex")]
     pub input: Vec<u8>,
     #[serde_as(as = "HexOrDecimalU256")]
     pub value: U256,
     pub access_list: AccessList,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "reason")]
-pub enum BanReason {
-    UnsettledConsecutiveAuctions,
-    HighSettleFailureRate,
 }

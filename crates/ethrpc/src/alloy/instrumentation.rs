@@ -9,15 +9,11 @@
 //! trait to conveniently create a new `Provider` with an additional
 //! [`LabelingLayer`].
 use {
-    crate::alloy::RpcClientRandomIdExt,
-    alloy::{
-        providers::{DynProvider, Provider, ProviderBuilder},
-        rpc::{
-            client::RpcClient,
-            json_rpc::{RequestPacket, ResponsePacket, SerializedRequest},
-        },
-        transports::TransportError,
-    },
+    crate::{Web3, alloy::RpcClientRandomIdExt},
+    alloy_json_rpc::{RequestPacket, ResponsePacket, SerializedRequest},
+    alloy_provider::{Provider, ProviderBuilder},
+    alloy_rpc_client::RpcClient,
+    alloy_transport::TransportError,
     std::{
         fmt::Debug,
         pin::Pin,
@@ -151,16 +147,29 @@ where
 
 pub trait ProviderLabelingExt {
     /// Creates a new provider tagged with another label.
-    fn labeled(&self, label: String) -> Self;
+    fn labeled<S: ToString>(&self, label: S) -> Self;
 }
 
-impl ProviderLabelingExt for DynProvider {
-    fn labeled(&self, label: String) -> Self {
-        let is_local = self.client().is_local();
-        let transport = self.client().transport().clone();
-        let transport_with_label = LabelingLayer { label }.layer(transport);
+impl ProviderLabelingExt for Web3 {
+    fn labeled<S: ToString>(&self, label: S) -> Self {
+        let is_local = self.provider.client().is_local();
+        let transport = self.provider.client().transport().clone();
+        let transport_with_label = LabelingLayer {
+            label: label.to_string(),
+        }
+        .layer(transport);
         let client = RpcClient::with_random_id(transport_with_label, is_local);
-        ProviderBuilder::new().connect_client(client).erased()
+        let alloy = ProviderBuilder::new()
+            .wallet(self.wallet.clone())
+            // TODO: eventually remove this and all the other simple nonce managers
+            .with_simple_nonce_management()
+            .connect_client(client)
+            .erased();
+
+        Self {
+            provider: alloy,
+            wallet: self.wallet.clone(),
+        }
     }
 }
 

@@ -3,7 +3,10 @@ use {
         primitives::{Address, U256, address, map::AddressMap},
         providers::Provider,
     },
+    autopilot::config::Configuration,
+    balance_overrides::{BalanceOverrides, BalanceOverriding, Strategy},
     bigdecimal::{BigDecimal, Zero},
+    configs::test_util::TestDefault,
     e2e::setup::*,
     ethrpc::{Web3, alloy::CallBuilderExt},
     model::{
@@ -12,20 +15,13 @@ use {
         quote::{OrderQuoteRequest, OrderQuoteSide, SellAmount},
     },
     number::{nonzero::NonZeroU256, units::EthUnit},
-    serde_json::json,
-    shared::{
-        price_estimation::{
-            Estimate,
-            Verification,
-            trade_verifier::{
-                PriceQuery,
-                TradeVerifier,
-                TradeVerifying,
-                balance_overrides::{BalanceOverrides, BalanceOverriding, Strategy},
-            },
-        },
+    price_estimation::{
+        Estimate,
+        Verification,
         trade_finding::{Interaction, LegacyTrade, QuoteExecution, TradeKind},
+        trade_verifier::{PriceQuery, TradeVerifier, TradeVerifying},
     },
+    serde_json::json,
     std::sync::Arc,
 };
 
@@ -143,7 +139,7 @@ async fn test_bypass_verification_for_rfq_quotes(web3: Web3) {
         "https" => url.set_scheme("wss").unwrap(),
         _ => unreachable!("unexpected scheme"),
     }
-    let block_stream = ethrpc::block_stream::current_block_ws_stream(web3.alloy.clone(), url)
+    let block_stream = ethrpc::block_stream::current_block_ws_stream(web3.provider.clone(), url)
         .await
         .unwrap();
     let onchain = OnchainComponents::deployed(web3.clone()).await;
@@ -385,6 +381,8 @@ async fn verified_quote_with_simulated_balance(web3: Web3) {
                 ],
                 ..Default::default()
             },
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration::test_default(),
             solver,
         )
         .await;
@@ -421,7 +419,7 @@ async fn verified_quote_with_simulated_balance(web3: Web3) {
     assert!(
         onchain
             .web3()
-            .alloy
+            .provider
             .get_balance(trader.address())
             .await
             .unwrap()
@@ -528,6 +526,8 @@ async fn usdt_quote_verification(web3: Web3) {
                 api: vec!["--quote-autodetect-token-balance-overrides=true".to_string()],
                 ..Default::default()
             },
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration::test_default(),
             solver,
         )
         .await;
@@ -552,7 +552,7 @@ async fn usdt_quote_verification(web3: Web3) {
 /// This test verifies the trace-based detection strategy that's similar to
 /// Foundry's `deal`.
 async fn trace_based_balance_detection(web3: Web3) {
-    use shared::price_estimation::trade_verifier::balance_overrides::detector::Detector;
+    use balance_overrides::detector::Detector;
 
     tracing::info!("Setting up chain state.");
     let mut onchain = OnchainComponents::deploy(web3.clone()).await;
@@ -567,7 +567,7 @@ async fn trace_based_balance_detection(web3: Web3) {
     // offset within a struct mapping, making it undetectable by standard slot
     // calculation methods
     let struct_offset_token =
-        contracts::alloy::test::NonStandardERC20Balances::Instance::deploy(web3.alloy.clone())
+        contracts::alloy::test::NonStandardERC20Balances::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
 
@@ -577,14 +577,14 @@ async fn trace_based_balance_detection(web3: Web3) {
     // calling another contract to get a balance--or calling another contract to
     // *not* get a balance)
     let local_storage_token = contracts::alloy::test::RemoteERC20Balances::Instance::deploy(
-        web3.alloy.clone(),
+        web3.provider.clone(),
         weth,
         true,
     )
     .await
     .unwrap();
     let delegated_storage_token = contracts::alloy::test::RemoteERC20Balances::Instance::deploy(
-        web3.alloy.clone(),
+        web3.provider.clone(),
         weth,
         false,
     )
@@ -675,10 +675,7 @@ async fn trace_based_balance_detection(web3: Web3) {
         test_account: Address,
         test_balance: U256,
     ) {
-        use {
-            shared::price_estimation::trade_verifier::balance_overrides::BalanceOverrideRequest,
-            std::collections::HashMap,
-        };
+        use {balance_overrides::BalanceOverrideRequest, std::collections::HashMap};
 
         let balance_overrides = BalanceOverrides {
             hardcoded: HashMap::from([(token, strategy)]),
@@ -697,7 +694,7 @@ async fn trace_based_balance_detection(web3: Web3) {
         let (override_token, state_override) = override_result.unwrap();
 
         // Call balanceOf with the state override to verify it works
-        let token_contract = ERC20::Instance::new(token, web3.alloy.clone());
+        let token_contract = ERC20::Instance::new(token, web3.provider.clone());
         let balance = token_contract
             .balanceOf(test_account)
             .state(AddressMap::from_iter([(

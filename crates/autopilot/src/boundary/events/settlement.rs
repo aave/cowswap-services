@@ -1,13 +1,16 @@
 use {
-    crate::{database::Postgres, domain::settlement},
+    crate::database::Postgres,
     alloy::{
         primitives::Address,
         rpc::types::{Filter, Log},
     },
     anyhow::Result,
     contracts::alloy::GPv2Settlement::GPv2Settlement::GPv2SettlementEvents,
-    ethrpc::{AlloyProvider, block_stream::RangeInclusive},
-    shared::event_handling::{AlloyEventRetrieving, EventStoring},
+    ethrpc::AlloyProvider,
+    event_indexing::{
+        block_retriever::RangeInclusive,
+        event_handler::{AlloyEventRetrieving, EventStoring},
+    },
 };
 
 pub struct GPv2SettlementContract {
@@ -35,16 +38,14 @@ impl AlloyEventRetrieving for GPv2SettlementContract {
 
 pub struct Indexer {
     db: Postgres,
-    start_index: u64,
-    settlement_observer: settlement::Observer,
+    start_indexing_block: u64,
 }
 
 impl Indexer {
-    pub fn new(db: Postgres, settlement_observer: settlement::Observer, start_index: u64) -> Self {
+    pub fn new(db: Postgres, start_indexing_block: u64) -> Self {
         Self {
             db,
-            settlement_observer,
-            start_index,
+            start_indexing_block,
         }
     }
 }
@@ -57,7 +58,7 @@ impl EventStoring<(GPv2SettlementEvents, Log)> for Indexer {
     async fn last_event_block(&self) -> Result<u64> {
         super::read_last_block_from_db(&self.db.pool, INDEX_NAME)
             .await
-            .map(|last_block| last_block.max(self.start_index))
+            .map(|last_block| last_block.max(self.start_indexing_block))
     }
 
     async fn persist_last_indexed_block(&mut self, latest_block: u64) -> Result<()> {
@@ -74,10 +75,6 @@ impl EventStoring<(GPv2SettlementEvents, Log)> for Indexer {
         crate::database::events::replace_events(&mut transaction, events, from_block).await?;
         database::settlements::delete(&mut transaction, from_block).await?;
         transaction.commit().await?;
-
-        self.settlement_observer
-            .post_process_outstanding_settlement_transactions()
-            .await;
         Ok(())
     }
 
@@ -85,10 +82,6 @@ impl EventStoring<(GPv2SettlementEvents, Log)> for Indexer {
         let mut transaction = self.db.pool.begin().await?;
         crate::database::events::append_events(&mut transaction, events).await?;
         transaction.commit().await?;
-
-        self.settlement_observer
-            .post_process_outstanding_settlement_transactions()
-            .await;
         Ok(())
     }
 }

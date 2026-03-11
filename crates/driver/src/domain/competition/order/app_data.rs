@@ -1,5 +1,5 @@
 use {
-    crate::util::Bytes,
+    alloy::primitives::FixedBytes,
     anyhow::Context,
     app_data::AppDataDocument,
     derive_more::From,
@@ -81,7 +81,8 @@ impl AppDataRetriever {
                         true => None, // empty app data
                         false => Some(Arc::new(app_data::ValidatedAppData {
                             hash: app_data::AppDataHash(app_data.0.0),
-                            protocol: app_data::parse(appdata.full_app_data.as_bytes())?,
+                            protocol: app_data::parse(appdata.full_app_data.as_bytes())
+                                .context("invalid app data json")?,
                             document: appdata.full_app_data,
                         })),
                     }
@@ -157,7 +158,7 @@ pub const APP_DATA_LEN: usize = 32;
 /// While this type holds the hash, the data itself is uploaded to IPFS. This
 /// hash is signed along with the order.
 #[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq)]
-pub struct AppDataHash(pub Bytes<[u8; APP_DATA_LEN]>);
+pub struct AppDataHash(pub FixedBytes<APP_DATA_LEN>);
 
 impl From<[u8; APP_DATA_LEN]> for AppDataHash {
     fn from(inner: [u8; APP_DATA_LEN]) -> Self {

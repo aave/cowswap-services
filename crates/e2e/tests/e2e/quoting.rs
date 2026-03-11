@@ -1,4 +1,6 @@
 use {
+    autopilot::config::Configuration,
+    configs::test_util::TestDefault,
     e2e::setup::{colocation::SolverEngine, mock::Mock, *},
     ethrpc::alloy::CallBuilderExt,
     futures::FutureExt,
@@ -9,7 +11,7 @@ use {
     },
     number::{nonzero::NonZeroU256, units::EthUnit},
     serde_json::json,
-    shared::ethrpc::Web3,
+    shared::{fee_factor::FeeFactor, web3::Web3},
     std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -74,15 +76,21 @@ async fn test(web3: Web3) {
     tracing::info!("Starting services.");
     let services = Services::new(&onchain).await;
     // Start API with 0.02% (2 bps) volume fee
-    let args = ExtraServiceArgs {
-        api: vec![
-            "--volume-fee-factor=0.0002".to_string(),
-            // Set a far future effective timestamp to ensure the fee is not applied
-            "--volume-fee-effective-timestamp=2099-01-01T10:00:00Z".to_string(),
-        ],
-        ..Default::default()
-    };
-    services.start_protocol_with_args(args, solver).await;
+    services
+        .start_protocol_with_args(
+            Default::default(),
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration {
+                volume_fee: Some(orderbook::config::VolumeFeeConfig {
+                    factor: Some(FeeFactor::new(0.0002)),
+                    // Set a far future effective timestamp to ensure the fee is not applied
+                    effective_from_timestamp: Some("2099-01-01T10:00:00Z".parse().unwrap()),
+                }),
+                ..orderbook::config::Configuration::test_default()
+            },
+            solver,
+        )
+        .await;
 
     tracing::info!("Quoting order");
     let request = OrderQuoteRequest {
@@ -276,7 +284,7 @@ async fn quote_timeout(web3: Web3) {
     tracing::info!("Starting services.");
     let services = Services::new(&onchain).await;
 
-    let mock_solver = Mock::default();
+    let mock_solver = Mock::new().await;
 
     // Start system
     colocation::start_driver(
@@ -289,6 +297,8 @@ async fn quote_timeout(web3: Web3) {
                 base_tokens: vec![*sell_token.address()],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
             SolverEngine {
                 name: "test_quoter".into(),
@@ -297,6 +307,8 @@ async fn quote_timeout(web3: Web3) {
                 base_tokens: vec![*sell_token.address()],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
@@ -308,12 +320,25 @@ async fn quote_timeout(web3: Web3) {
     const MAX_QUOTE_TIME_MS: u64 = 500;
 
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_quoter".to_string(),
-            "--native-price-estimators=Driver|test_quoter|http://localhost:11088/test_solver"
-                .to_string(),
-            format!("--quote-timeout={MAX_QUOTE_TIME_MS}ms"),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_quoter"
+                    .to_string(),
+                format!("--quote-timeout={MAX_QUOTE_TIME_MS}ms"),
+            ],
+            orderbook::config::Configuration {
+                native_price_estimation: orderbook::config::native_price::NativePriceConfig {
+                    estimators: price_estimation::NativePriceEstimators::new(vec![vec![
+                        price_estimation::NativePriceEstimator::driver(
+                            "test_quoter".to_string(),
+                            "http://localhost:11088/test_solver".parse().unwrap(),
+                        ),
+                    ]]),
+                    ..orderbook::config::native_price::NativePriceConfig::test_default()
+                },
+                ..orderbook::config::Configuration::test_default()
+            },
+        )
         .await;
 
     mock_solver.configure_solution_async(Arc::new(|| {
@@ -449,20 +474,28 @@ async fn volume_fee(web3: Web3) {
     // Start API with 0.02% (2 bps) default volume fee
     // Bucket override: WETH<->override_token pair gets 5 bps (both tokens must be
     // in bucket)
-    let args = ExtraServiceArgs {
-        api: vec![
-            "--volume-fee-factor=0.0002".to_string(),
-            // Set a past effective timestamp to ensure the fee is applied
-            "--volume-fee-effective-timestamp=2000-01-01T10:00:00Z".to_string(),
-            format!(
-                "--volume-fee-bucket-overrides=0.0005:{};{}",
-                onchain.contracts().weth.address(),
-                override_token.address()
-            ),
-        ],
-        ..Default::default()
-    };
-    services.start_protocol_with_args(args, solver).await;
+    services
+        .start_protocol_with_args(
+            ExtraServiceArgs {
+                api: vec![format!(
+                    "--volume-fee-bucket-overrides=0.0005:{};{}",
+                    onchain.contracts().weth.address(),
+                    override_token.address()
+                )],
+                ..Default::default()
+            },
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration {
+                volume_fee: Some(orderbook::config::VolumeFeeConfig {
+                    factor: Some(FeeFactor::new(0.0002)),
+                    // Set a past effective timestamp to ensure the fee is applied
+                    effective_from_timestamp: Some("2000-01-01T10:00:00Z".parse().unwrap()),
+                }),
+                ..orderbook::config::Configuration::test_default()
+            },
+            solver,
+        )
+        .await;
 
     tracing::info!("Testing SELL quote with volume fee");
     let sell_request = OrderQuoteRequest {

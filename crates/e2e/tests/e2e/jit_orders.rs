@@ -1,5 +1,7 @@
 use {
     ::alloy::primitives::U256,
+    autopilot::config::Configuration,
+    configs::test_util::TestDefault,
     e2e::setup::{colocation::SolverEngine, mock::Mock, solution::JitOrder, *},
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -7,7 +9,7 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
     solvers_dto::solution::{Asset, Solution},
     std::collections::HashMap,
 };
@@ -57,7 +59,7 @@ async fn single_limit_order_test(web3: Web3) {
 
     let services = Services::new(&onchain).await;
 
-    let mock_solver = Mock::default();
+    let mock_solver = Mock::new().await;
 
     // Start system
     colocation::start_driver(
@@ -79,6 +81,8 @@ async fn single_limit_order_test(web3: Web3) {
                 base_tokens: vec![*token.address()],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
@@ -91,19 +95,20 @@ async fn single_limit_order_test(web3: Web3) {
         .start_autopilot(
             None,
             vec![
-                format!(
-                    "--drivers=mock_solver|http://localhost:11088/mock_solver|{}",
-                    const_hex::encode(solver.address())
-                ),
                 "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
                     .to_string(),
             ],
+            Configuration::test("mock_solver", solver.address()),
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Place order

@@ -4,7 +4,9 @@ use {
         providers::ext::{AnvilApi, ImpersonateConfig},
         signers::SignerSync,
     },
+    autopilot::config::Configuration,
     chrono::Utc,
+    configs::test_util::TestDefault,
     contracts::alloy::{ERC20, LiquoriceSettlement},
     driver::infra,
     e2e::{
@@ -65,17 +67,17 @@ async fn liquidity_source_notification(web3: Web3) {
     // Access trade tokens contracts
     let token_usdc = ERC20::Instance::new(
         address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-        web3.alloy.clone(),
+        web3.provider.clone(),
     );
 
     let token_usdt = ERC20::Instance::new(
         address!("dac17f958d2ee523a2206206994597c13d831ec7"),
-        web3.alloy.clone(),
+        web3.provider.clone(),
     );
 
     // CoW onchain setup
     // Fund trader
-    web3.alloy
+    web3.provider
         .anvil_send_impersonated_transaction_with_config(
             token_usdc
                 .transfer(trader.address(), trade_amount)
@@ -93,7 +95,7 @@ async fn liquidity_source_notification(web3: Web3) {
         .unwrap();
 
     // Fund solver
-    web3.alloy
+    web3.provider
         .anvil_send_impersonated_transaction_with_config(
             token_usdc
                 .transfer(solver.address(), trade_amount)
@@ -122,7 +124,7 @@ async fn liquidity_source_notification(web3: Web3) {
 
     // Liquorice settlement contract through which we will trade with the
     // `liquorice_maker`
-    let liquorice_settlement = LiquoriceSettlement::Instance::deployed(&web3.alloy)
+    let liquorice_settlement = LiquoriceSettlement::Instance::deployed(&web3.provider)
         .await
         .unwrap();
 
@@ -133,7 +135,7 @@ async fn liquidity_source_notification(web3: Web3) {
         .expect("no balance manager found");
 
     // Fund `liquorice_maker`
-    web3.alloy
+    web3.provider
         .anvil_send_impersonated_transaction_with_config(
             token_usdt
                 .transfer(liquorice_maker.address(), trade_amount)
@@ -162,7 +164,7 @@ async fn liquidity_source_notification(web3: Web3) {
     let liquorice_api = api::liquorice::server::LiquoriceApi::start().await;
 
     // CoW services setup
-    let liquorice_solver_api_mock = Mock::default();
+    let liquorice_solver_api_mock = Mock::new().await;
     let services = Services::new(&onchain).await;
 
     colocation::start_driver_with_config_override(
@@ -184,6 +186,8 @@ async fn liquidity_source_notification(web3: Web3) {
                 base_tokens: vec![],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
@@ -199,23 +203,25 @@ http-timeout = "10s"
             liquorice_api.port
         )),
     );
+
     services
         .start_autopilot(
             None,
             vec![
                 "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
                     .to_string(),
-                format!(
-                    "--drivers=liquorice_solver|http://localhost:11088/liquorice_solver|{}",
-                    const_hex::encode(solver.address())
-                ),
             ],
+            Configuration::test("liquorice_solver", solver.address()),
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Create CoW order

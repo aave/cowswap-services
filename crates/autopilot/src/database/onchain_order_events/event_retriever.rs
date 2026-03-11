@@ -5,7 +5,8 @@ use {
         sol_types::SolEvent,
     },
     contracts::alloy::CoWSwapOnchainOrders,
-    shared::{ethrpc::Web3, event_handling::AlloyEventRetrieving},
+    ethrpc::Web3,
+    event_indexing::event_handler::AlloyEventRetrieving,
 };
 
 // Note: we use a custom implementation of `EventRetrieving` rather than using
@@ -43,6 +44,6 @@ impl AlloyEventRetrieving for CoWSwapOnchainOrdersContract {
     }
 
     fn provider(&self) -> &alloy::providers::DynProvider {
-        &self.web3.alloy
+        &self.web3.provider
     }
 }

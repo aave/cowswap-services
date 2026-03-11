@@ -1,8 +1,9 @@
 use {
     crate::{AppDataHash, Hooks, app_data_hash::hash_full_app_data},
-    alloy::primitives::{Address, U256},
-    anyhow::{Context, Result, anyhow},
+    alloy_primitives::{Address, U256},
+    anyhow::{Result, anyhow},
     bytes_hex::BytesHex,
+    moka::sync::Cache,
     number::serialization::HexOrDecimalU256,
     serde::{Deserialize, Deserializer, Serialize, Serializer, de},
     serde_with::serde_as,
@@ -137,45 +138,58 @@ impl<'de> Deserialize<'de> for FeePolicy {
     where
         D: Deserializer<'de>,
     {
+        // The untagged enum does not provide enough information when deserialization
+        // fails since it thinks that any unknown or mismatched fields are just
+        // an issue with the enum variant which the error will reflect —
+        // something among the lines of "did not match any variant of the untagged enum"
+        // This is an hacky way of ensuring we get proper behavior when failing to
+        // deserialize numbers, for example, when users send bps as floats
         #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
-            #[serde(rename_all = "camelCase")]
-            Surplus {
-                surplus_bps: u64,
-                max_volume_bps: u64,
-            },
-            #[serde(rename_all = "camelCase")]
-            PriceImprovement {
-                price_improvement_bps: u64,
-                max_volume_bps: u64,
-            },
-            #[serde(rename_all = "camelCase")]
-            Volume { volume_bps: u64 },
-            // Originally only volume fees were allowed and they used the field `bps`.
-            // To stay backwards compatible with old appdata we still support this old
-            // format.
-            #[serde(rename_all = "camelCase")]
-            VolumeOld { bps: u64 },
+        #[serde(rename_all = "camelCase")]
+        struct FeePolicyDeserializer {
+            surplus_bps: Option<u64>,
+            max_volume_bps: Option<u64>,
+            price_improvement_bps: Option<u64>,
+            volume_bps: Option<u64>,
+            bps: Option<u64>,
         }
 
-        match Helper::deserialize(deserializer)? {
-            Helper::Surplus {
-                surplus_bps,
-                max_volume_bps,
+        match FeePolicyDeserializer::deserialize(deserializer)? {
+            FeePolicyDeserializer {
+                surplus_bps: Some(surplus_bps),
+                max_volume_bps: Some(max_volume_bps),
+                price_improvement_bps: None,
+                volume_bps: None,
+                bps: None,
             } => Ok(FeePolicy::Surplus {
                 bps: surplus_bps,
                 max_volume_bps,
             }),
-            Helper::PriceImprovement {
-                price_improvement_bps,
-                max_volume_bps,
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: Some(max_volume_bps),
+                price_improvement_bps: Some(price_improvement_bps),
+                volume_bps: None,
+                bps: None,
             } => Ok(FeePolicy::PriceImprovement {
                 bps: price_improvement_bps,
                 max_volume_bps,
             }),
-            Helper::Volume { volume_bps } => Ok(FeePolicy::Volume { bps: volume_bps }),
-            Helper::VolumeOld { bps } => Ok(FeePolicy::Volume { bps }),
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: None,
+                price_improvement_bps: None,
+                volume_bps: Some(volume_bps),
+                bps: None,
+            } => Ok(FeePolicy::Volume { bps: volume_bps }),
+            FeePolicyDeserializer {
+                surplus_bps: None,
+                max_volume_bps: None,
+                price_improvement_bps: None,
+                volume_bps: None,
+                bps: Some(bps),
+            } => Ok(FeePolicy::Volume { bps }),
+            _ => Err(serde::de::Error::custom("unknown fee policy format")),
         }
     }
 }
@@ -274,8 +288,8 @@ impl Validator {
     }
 }
 
-pub fn parse(full_app_data: &[u8]) -> Result<ProtocolAppData> {
-    let root = serde_json::from_slice::<Root>(full_app_data).context("invalid app data json")?;
+pub fn parse(full_app_data: &[u8]) -> Result<ProtocolAppData, serde_json::Error> {
+    let root = serde_json::from_slice::<Root>(full_app_data)?;
     let parsed = root
         .metadata
         .or_else(|| root.backend.map(ProtocolAppData::from))
@@ -340,6 +354,34 @@ impl Root {
             metadata,
             backend: None,
         }
+    }
+}
+
+/// Caches whether a given app data document contains wrappers, keyed by
+/// hash. This avoids re-parsing the same JSON across orders and auction
+/// cycles. We're using the default TinyLFU eviction policy, but the capacity is
+/// large enough that we don't expect eviction to be a problem in practice, but
+/// we limit the size to prevent potential memory exhaustion attacks.
+pub struct WrapperCache(Cache<AppDataHash, bool>);
+
+impl WrapperCache {
+    pub fn new(capacity: u64) -> Self {
+        Self(Cache::new(capacity))
+    }
+
+    /// Returns `true` if order appData contains non-empty wrappers
+    pub fn has_wrappers(&self, hash: &AppDataHash, document: Option<&str>) -> bool {
+        if let Some(cached) = self.0.get(hash) {
+            return cached;
+        }
+        let result = document.is_some_and(|doc| {
+            serde_json::from_str::<Root>(doc)
+                .ok()
+                .and_then(|root| root.metadata)
+                .is_some_and(|m| !m.wrappers.is_empty())
+        });
+        self.0.insert(*hash, result);
+        result
     }
 }
 
@@ -434,17 +476,34 @@ impl<'de> Deserialize<'de> for PartnerFees {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Helper {
-            Single(PartnerFee),
-            Multiple(Vec<PartnerFee>),
+        struct PartnerFeesVisitor;
+
+        impl<'de> de::Visitor<'de> for PartnerFeesVisitor {
+            type Value = PartnerFees;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a single partner fee object or an array of partner fees")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let fee = PartnerFee::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(PartnerFees(vec![fee]))
+            }
+
+            fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let fees =
+                    Vec::<PartnerFee>::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(PartnerFees(fees))
+            }
         }
 
-        match Helper::deserialize(deserializer)? {
-            Helper::Single(fee) => Ok(PartnerFees(vec![fee])),
-            Helper::Multiple(fees) => Ok(PartnerFees(fees)),
-        }
+        deserializer.deserialize_any(PartnerFeesVisitor)
     }
 }
 
@@ -768,6 +827,24 @@ mod tests {
             "#,
             ProtocolAppData::default(),
         );
+    }
+
+    #[test]
+    fn wrapper_cache_detects_wrappers() {
+        let cache = WrapperCache::new(100);
+        let h = |b: u8| AppDataHash([b; 32]);
+
+        assert!(!cache.has_wrappers(&h(1), None));
+        assert!(!cache.has_wrappers(&h(2), Some("{}")));
+        assert!(!cache.has_wrappers(&h(3), Some(r#"{"metadata": {}}"#)));
+        assert!(!cache.has_wrappers(&h(4), Some(r#"{"metadata": {"wrappers": []}}"#)));
+        assert!(cache.has_wrappers(
+            &h(5),
+            Some(r#"{"metadata": {"wrappers": [{"address": "0x0000000000000000000000000000000000000001", "data": "0x"}]}}"#),
+        ));
+
+        // Second call hits the cache
+        assert!(cache.has_wrappers(&h(5), None));
     }
 
     #[test]

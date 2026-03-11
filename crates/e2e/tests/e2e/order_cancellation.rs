@@ -1,5 +1,7 @@
 use {
     ::alloy::primitives::U256,
+    autopilot::config::Configuration,
+    configs::test_util::TestDefault,
     database::order_events::OrderEventLabel,
     e2e::setup::*,
     ethrpc::alloy::CallBuilderExt,
@@ -19,7 +21,7 @@ use {
     },
     number::{nonzero::NonZeroU256, units::EthUnit},
     serde_json::json,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
 };
 
 #[tokio::test]
@@ -72,12 +74,20 @@ async fn order_cancellation(web3: Web3) {
                 "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
                     .to_string(),
             ],
+            // Empty drivers to prevent settlement — this test places multiple
+            // orders and asserts exact auction counts, which would race with the
+            // solver settling them.
+            Configuration::test_no_drivers(),
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     onchain.mint_block().await;
@@ -184,7 +194,14 @@ async fn order_cancellation(web3: Web3) {
     ];
     onchain.mint_block().await;
     wait_for_condition(TIMEOUT, || async {
-        services.get_auction().await.auction.orders.len() == 3
+        const WAIT_FOR_N_ORDERS: usize = 3;
+        let n_orders = services.get_auction().await.auction.orders.len();
+        tracing::debug!(
+            "received number of orders: {}, waiting for {}",
+            n_orders,
+            WAIT_FOR_N_ORDERS
+        );
+        n_orders == WAIT_FOR_N_ORDERS
     })
     .await
     .unwrap();

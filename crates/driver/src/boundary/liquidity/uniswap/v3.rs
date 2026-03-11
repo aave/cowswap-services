@@ -11,25 +11,17 @@ use {
         infra::{self, blockchain::Ethereum},
     },
     anyhow::Context,
-    ethrpc::block_stream::BlockRetrieving,
-    shared::{
-        http_solver::model::TokenAmount,
-        interaction::Interaction,
-        maintenance::ServiceMaintenance,
-        sources::uniswap_v3::pool_fetching::UniswapV3PoolFetcher,
-    },
+    event_indexing::{block_retriever::BlockRetrieving, maintenance::ServiceMaintenance},
+    liquidity_sources::uniswap_v3::pool_fetching::UniswapV3PoolFetcher,
+    shared::{http_solver::model::TokenAmount, interaction::Interaction},
     solver::{
-        interactions::allowances::Allowances,
         liquidity::{
             ConcentratedLiquidity,
             uniswap_v3::{self, UniswapV3Liquidity, UniswapV3SettlementHandler},
         },
         liquidity_collector::{BackgroundInitLiquiditySource, LiquidityCollecting},
     },
-    std::{
-        collections::BTreeMap,
-        sync::{Arc, Mutex},
-    },
+    std::{collections::BTreeMap, sync::Arc},
 };
 
 pub fn to_domain(id: liquidity::Id, pool: ConcentratedLiquidity) -> Result<liquidity::Liquidity> {
@@ -56,7 +48,7 @@ pub fn to_domain(id: liquidity::Id, pool: ConcentratedLiquidity) -> Result<liqui
             )?,
             sqrt_price: SqrtPrice(pool.pool.state.sqrt_price),
             liquidity: Liquidity(u128::try_from(pool.pool.state.liquidity)?),
-            tick: Tick(pool.pool.state.tick.try_into()?),
+            tick: Tick(pool.pool.state.tick.clone().try_into()?),
             liquidity_net: pool
                 .pool
                 .state
@@ -77,14 +69,9 @@ pub fn to_interaction(
     output: &liquidity::ExactOutput,
     receiver: &eth::Address,
 ) -> eth::Interaction {
-    let handler = UniswapV3SettlementHandler::new(
-        pool.router.into(),
-        *receiver,
-        Mutex::new(Allowances::empty(*receiver)),
-        pool.fee.0,
-    );
+    let handler = UniswapV3SettlementHandler::new(pool.router.into(), *receiver, pool.fee.0);
 
-    let (_, interaction) = handler.settle(
+    let interaction = handler.settle(
         TokenAmount::new(input.0.token.into(), input.0.amount),
         TokenAmount::new(output.0.token.into(), output.0.amount),
     );
@@ -93,7 +80,7 @@ pub fn to_interaction(
     eth::Interaction {
         target: encoded.0,
         value: encoded.1.into(),
-        call_data: crate::util::Bytes(encoded.2.0.to_vec()),
+        call_data: encoded.2,
     }
 }
 
@@ -147,7 +134,6 @@ async fn init_liquidity(
     Ok(UniswapV3Liquidity::new(
         config.router.into(),
         *eth.contracts().settlement().address(),
-        web3,
         pool_fetcher,
     ))
 }

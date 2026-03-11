@@ -27,10 +27,8 @@ use {
         onchain_broadcasted_orders::{OnchainOrderPlacement, OnchainOrderPlacementError},
         orders::{Order, OrderClass, insert_quotes},
     },
-    ethrpc::{
-        Web3,
-        block_stream::{RangeInclusive, timestamp_of_block_in_seconds},
-    },
+    ethrpc::{Web3, block_stream::timestamp_of_block_in_seconds},
+    event_indexing::{block_retriever::RangeInclusive, event_handler::EventStoring},
     futures::{StreamExt, stream},
     itertools::{izip, multiunzip},
     model::{
@@ -53,7 +51,6 @@ use {
             sell_token_source_into,
             signing_scheme_into,
         },
-        event_handling::EventStoring,
         order_quoting::{OrderQuoting, Quote, QuoteSearchParameters},
         order_validation::{
             ValidationError,
@@ -393,9 +390,11 @@ async fn get_block_numbers_of_events(
     let futures = event_block_numbers
         .into_iter()
         .map(|block_number| async move {
-            let timestamp =
-                timestamp_of_block_in_seconds(&web3.alloy, BlockNumberOrTag::Number(block_number))
-                    .await?;
+            let timestamp = timestamp_of_block_in_seconds(
+                &web3.provider,
+                BlockNumberOrTag::Number(block_number),
+            )
+            .await?;
             Ok((block_number, timestamp))
         });
     let block_number_timestamp_pair: Vec<anyhow::Result<(u64, u32)>> =
@@ -780,7 +779,6 @@ mod test {
 
     use {
         super::*,
-        crate::database::Config,
         alloy::primitives::U256,
         contracts::alloy::CoWSwapOnchainOrders,
         database::{byte_array::ByteArray, onchain_broadcasted_orders::OnchainOrderPlacement},
@@ -802,7 +800,6 @@ mod test {
             order_quoting::{MockOrderQuoting, Quote, QuoteData},
         },
         sqlx::PgPool,
-        std::num::NonZeroUsize,
     };
 
     #[test]
@@ -1250,11 +1247,9 @@ mod test {
         let onchain_order_parser = OnchainOrderParser {
             db: Postgres {
                 pool: PgPool::connect_lazy("postgresql://").unwrap(),
-                config: Config {
-                    insert_batch_size: NonZeroUsize::new(500).unwrap(),
-                },
+                config: Default::default(),
             },
-            trampoline: HooksTrampoline::Instance::deployed(&web3.alloy)
+            trampoline: HooksTrampoline::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
             web3,

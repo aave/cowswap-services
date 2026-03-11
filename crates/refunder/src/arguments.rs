@@ -1,7 +1,7 @@
 use {
     alloy::primitives::Address,
     clap::Parser,
-    shared::{arguments::display_option, ethrpc, http_client, logging_args_with_default_filter},
+    shared::{arguments::display_option, http_client, logging_args_with_default_filter, web3},
     std::time::Duration,
     url::Url,
 };
@@ -14,10 +14,13 @@ pub struct Arguments {
     pub http_client: http_client::Arguments,
 
     #[clap(flatten)]
-    pub ethrpc: ethrpc::Arguments,
+    pub ethrpc: web3::Arguments,
 
     #[clap(flatten)]
     pub logging: LoggingArguments,
+
+    #[clap(flatten)]
+    pub database_pool: shared::arguments::DatabasePoolConfig,
 
     /// Minimum time in seconds an order must have been valid for
     /// to be eligible for refunding
@@ -94,6 +97,7 @@ impl std::fmt::Display for Arguments {
             ethflow_contracts,
             metrics_port,
             logging,
+            database_pool,
             db_url,
             refunder_pk,
             max_gas_price,
@@ -104,6 +108,7 @@ impl std::fmt::Display for Arguments {
         write!(f, "{http_client}")?;
         write!(f, "{ethrpc}")?;
         write!(f, "{logging}")?;
+        write!(f, "{database_pool}")?;
         writeln!(f, "min_validity_duration: {min_validity_duration:?}")?;
         writeln!(f, "min_price_deviation_bps: {min_price_deviation_bps}")?;
         let _intentionally_ignored = db_url;

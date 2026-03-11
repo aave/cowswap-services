@@ -1,7 +1,8 @@
 pub use load::load;
 use {
-    crate::{domain::eth, infra, util::serialize},
+    crate::{domain::eth, infra},
     alloy::{eips::BlockNumberOrTag, primitives::Address},
+    gas_price_estimation::configurable_alloy::{default_past_blocks, default_reward_percentile},
     number::serialization::HexOrDecimalU256,
     reqwest::Url,
     serde::{Deserialize, Deserializer, Serialize},
@@ -30,7 +31,7 @@ struct Config {
     /// Disable gas simulation and always use this fixed gas value instead. This
     /// can be useful for testing, but shouldn't be used in production since it
     /// will cause the driver to return invalid scores.
-    #[serde_as(as = "Option<serialize::U256>")]
+    #[serde_as(as = "Option<serde_ext::U256>")]
     disable_gas_simulation: Option<eth::U256>,
 
     /// Defines the gas estimator to use.
@@ -95,13 +96,13 @@ struct SubmissionConfig {
     /// The minimum priority fee in Gwei the solver is ensuring to pay in a
     /// settlement.
     #[serde(default)]
-    #[serde_as(as = "serialize::U256")]
+    #[serde_as(as = "serde_ext::U256")]
     min_priority_fee: eth::U256,
 
     /// The maximum gas price in Gwei the solver is willing to pay in a
     /// settlement.
     #[serde(default = "default_gas_price_cap")]
-    #[serde_as(as = "serialize::U256")]
+    #[serde_as(as = "serde_ext::U256")]
     gas_price_cap: eth::U256,
 
     /// The target confirmation time for settlement transactions used
@@ -134,16 +135,6 @@ enum BlockNumber {
     Earliest,
 }
 
-impl From<BlockNumber> for web3::types::BlockNumber {
-    fn from(bn: BlockNumber) -> Self {
-        match bn {
-            BlockNumber::Pending => web3::types::BlockNumber::Pending,
-            BlockNumber::Latest => web3::types::BlockNumber::Latest,
-            BlockNumber::Earliest => web3::types::BlockNumber::Earliest,
-        }
-    }
-}
-
 impl From<BlockNumber> for BlockNumberOrTag {
     fn from(value: BlockNumber) -> Self {
         match value {
@@ -165,7 +156,7 @@ struct Mempool {
     /// Maximum additional tip in Gwei that we are willing to give to
     /// the validator above regular gas price estimation.
     #[serde(default = "default_max_additional_tip")]
-    #[serde_as(as = "serialize::U256")]
+    #[serde_as(as = "serde_ext::U256")]
     max_additional_tip: eth::U256,
     /// Additional tip in percentage of max_fee_per_gas we are giving to
     /// validator above regular gas price estimation. Expects a
@@ -319,6 +310,16 @@ struct SolverConfig {
     /// Default: 0 (no haircut).
     #[serde(default)]
     haircut_bps: u32,
+
+    /// Additional EOAs that submit settlement txs on behalf of the solver
+    /// via EIP-7702 delegation. When non-empty, enables parallel submission
+    /// with one lane per account.
+    #[serde(default)]
+    submission_accounts: Vec<Account>,
+
+    /// Address of the deployed CowSettlementForwarder contract for EIP-7702
+    /// delegation. Required when `submission_accounts` is non-empty.
+    forwarder_contract: Option<eth::Address>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -383,7 +384,7 @@ struct Slippage {
 
     /// The absolute slippage allowed by the solver.
     #[serde(rename = "absolute-slippage")]
-    #[serde_as(as = "Option<serialize::U256>")]
+    #[serde_as(as = "Option<serde_ext::U256>")]
     absolute: Option<eth::U256>,
 }
 
@@ -735,13 +736,32 @@ pub struct LiquoriceConfig {
     pub http_timeout: Duration,
 }
 
-#[derive(Clone, Debug, Deserialize, Default)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-#[serde(tag = "estimator")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, tag = "estimator")]
 pub enum GasEstimatorType {
     Web3,
-    #[default]
-    Alloy,
+    /// EIP-1559 gas estimator using alloy's algorithm.
+    /// Optionally configure the fee history query parameters.
+    #[serde(rename_all = "kebab-case")]
+    Alloy {
+        /// Number of blocks to look back for fee history (default: 10)
+        #[serde(default = "default_past_blocks")]
+        past_blocks: u64,
+        /// Percentile of rewards to use for priority fee estimation (default:
+        /// 20.0). This is what Metamask uses as medium priority:
+        /// https://github.com/MetaMask/core/blob/0fd4b397e7237f104d1c81579a0c4321624d076b/packages/gas-fee-controller/src/fetchGasEstimatesViaEthFeeHistory/calculateGasFeeEstimatesForPriorityLevels.ts#L14-L45
+        #[serde(default = "default_reward_percentile")]
+        reward_percentile: f64,
+    },
+}
+
+impl Default for GasEstimatorType {
+    fn default() -> Self {
+        Self::Alloy {
+            past_blocks: default_past_blocks(),
+            reward_percentile: default_reward_percentile(),
+        }
+    }
 }
 
 /// Defines various strategies to prioritize orders.
@@ -966,4 +986,125 @@ enum AtBlock {
     Latest,
     /// Use the latest finalized block.
     Finalized,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gas_estimator_alloy_defaults() {
+        let config: GasEstimatorType = toml::from_str(
+            r#"
+            estimator = "alloy"
+        "#,
+        )
+        .unwrap();
+
+        match config {
+            GasEstimatorType::Alloy {
+                past_blocks,
+                reward_percentile,
+            } => {
+                assert_eq!(past_blocks, 10);
+                assert_eq!(reward_percentile, 20.0);
+            }
+            _ => panic!("expected Alloy variant"),
+        }
+    }
+
+    #[test]
+    fn gas_estimator_alloy_custom_past_blocks() {
+        let config: GasEstimatorType = toml::from_str(
+            r#"
+            estimator = "alloy"
+            past-blocks = 5
+        "#,
+        )
+        .unwrap();
+
+        match config {
+            GasEstimatorType::Alloy {
+                past_blocks,
+                reward_percentile,
+            } => {
+                assert_eq!(past_blocks, 5);
+                assert_eq!(reward_percentile, 20.0);
+            }
+            _ => panic!("expected Alloy variant"),
+        }
+    }
+
+    #[test]
+    fn gas_estimator_alloy_custom_percentile() {
+        let config: GasEstimatorType = toml::from_str(
+            r#"
+            estimator = "alloy"
+            reward-percentile = 50.0
+        "#,
+        )
+        .unwrap();
+
+        match config {
+            GasEstimatorType::Alloy {
+                past_blocks,
+                reward_percentile,
+            } => {
+                assert_eq!(past_blocks, 10);
+                assert_eq!(reward_percentile, 50.0);
+            }
+            _ => panic!("expected Alloy variant"),
+        }
+    }
+
+    #[test]
+    fn gas_estimator_alloy_all_custom() {
+        let config: GasEstimatorType = toml::from_str(
+            r#"
+            estimator = "alloy"
+            past-blocks = 20
+            reward-percentile = 75.0
+        "#,
+        )
+        .unwrap();
+
+        match config {
+            GasEstimatorType::Alloy {
+                past_blocks,
+                reward_percentile,
+            } => {
+                assert_eq!(past_blocks, 20);
+                assert_eq!(reward_percentile, 75.0);
+            }
+            _ => panic!("expected Alloy variant"),
+        }
+    }
+
+    #[test]
+    fn gas_estimator_web3() {
+        let config: GasEstimatorType = toml::from_str(
+            r#"
+            estimator = "web3"
+        "#,
+        )
+        .unwrap();
+
+        assert!(matches!(config, GasEstimatorType::Web3));
+    }
+
+    #[test]
+    fn gas_estimator_default() {
+        let config = GasEstimatorType::default();
+
+        match config {
+            GasEstimatorType::Alloy {
+                past_blocks,
+                reward_percentile,
+            } => {
+                assert_eq!(past_blocks, 10);
+                assert_eq!(reward_percentile, 20.0);
+            }
+            _ => panic!("expected Alloy variant as default"),
+        }
+    }
 }

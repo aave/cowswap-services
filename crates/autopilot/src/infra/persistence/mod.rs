@@ -21,7 +21,7 @@ use {
             SellTokenSource as DbSellTokenSource,
             SigningScheme as DbSigningScheme,
         },
-        solver_competition_v2::{Order, Solution},
+        solver_competition_v2::{self, Order, Solution},
     },
     domain::auction::order::{
         BuyTokenDestination as DomainBuyTokenDestination,
@@ -38,10 +38,9 @@ use {
         time::Duration,
     },
     tokio::sync::mpsc,
-    tracing::Instrument,
+    tracing::{Instrument, instrument},
 };
 
-pub mod cli;
 pub mod dto;
 
 #[derive(Clone)]
@@ -81,7 +80,7 @@ impl Persistence {
         tokio::task::spawn(async move {
             while let Some(upload) = receiver.recv().await {
                 if let Err(err) = db
-                    .replace_current_auction(upload.auction_id, &upload.auction_data)
+                    .replace_current_auction(upload.auction_id, upload.auction_data)
                     .await
                 {
                     tracing::error!(?err, "failed to replace auction in DB");
@@ -171,9 +170,10 @@ impl Persistence {
         let Some(s3) = self.s3.clone() else {
             return;
         };
-        let auction_dto = dto::auction::from_domain(auction.clone());
+        let auction = auction.clone();
         tokio::task::spawn(async move {
-            match s3.upload(id.to_string(), &auction_dto).await {
+            let auction_dto = dto::auction::from_domain(auction);
+            match s3.upload(id.to_string(), auction_dto).await {
                 Ok(key) => tracing::info!(?key, "uploaded auction to s3"),
                 Err(err) => tracing::warn!(?err, "failed to upload auction to s3"),
             }
@@ -294,12 +294,39 @@ impl Persistence {
         order_uids: impl IntoIterator<Item = domain::OrderUid>,
         label: boundary::OrderEventLabel,
     ) {
+        let order_uids: Vec<_> = order_uids.into_iter().collect();
+        self.store_order_events_owned(order_uids, std::convert::identity, label);
+    }
+
+    /// A variants of [`store_order_events`] where [`items`] is already an owned
+    /// collection which allows us to move the logic to convert an item to a
+    /// [`domain::OrderUid`] into the background task as well.
+    #[instrument(skip_all)]
+    pub fn store_order_events_owned<I, F>(
+        &self,
+        items: I,
+        convert: F,
+        label: boundary::OrderEventLabel,
+    ) where
+        I: IntoIterator + Send + 'static,
+        I::Item: Send,
+        F: (Fn(I::Item) -> domain::OrderUid) + Send + 'static,
+    {
         let db = self.postgres.clone();
-        let order_uids = order_uids.into_iter().collect();
         tokio::spawn(
             async move {
-                let mut tx = db.pool.acquire().await.expect("failed to acquire tx");
-                store_order_events(&mut tx, order_uids, label, Utc::now()).await;
+                let order_uids = items.into_iter().map(convert).collect();
+                match db.pool.acquire().await {
+                    Ok(mut tx) => {
+                        store_order_events(&mut tx, order_uids, label, Utc::now()).await;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            ?err,
+                            "failed to acquire a connection to store order events!"
+                        );
+                    }
+                };
             }
             .instrument(tracing::Span::current()),
         );
@@ -532,8 +559,8 @@ impl Persistence {
     /// order creation timestamp, and minimum validity period.
     pub async fn solvable_orders_after(
         &self,
-        mut current_orders: HashMap<domain::OrderUid, model::order::Order>,
-        mut current_quotes: HashMap<domain::OrderUid, domain::Quote>,
+        mut current_orders: HashMap<domain::OrderUid, Arc<model::order::Order>>,
+        mut current_quotes: HashMap<domain::OrderUid, Arc<domain::Quote>>,
         after_timestamp: DateTime<Utc>,
         after_block: u64,
         min_valid_to: u32,
@@ -561,7 +588,7 @@ impl Persistence {
 
         // Fetch the orders that were updated after the given block and were created or
         // cancelled after the given timestamp.
-        let next_orders: HashMap<domain::OrderUid, model::order::Order> = {
+        let next_orders: HashMap<domain::OrderUid, Arc<model::order::Order>> = {
             let _timer = Metrics::get()
                 .database_queries
                 .with_label_values(&["open_orders_after"])
@@ -574,7 +601,7 @@ impl Persistence {
             )
             .map(|result| match result {
                 Ok(order) => full_order_into_model_order(order)
-                    .map(|order| (domain::OrderUid(order.metadata.uid.0), order)),
+                    .map(|order| (domain::OrderUid(order.metadata.uid.0), Arc::new(order))),
                 Err(err) => Err(anyhow::Error::from(err)),
             })
             .try_collect()
@@ -586,20 +613,9 @@ impl Persistence {
             .to_u64()
             .context("latest_settlement_block is not u64")?;
 
-        // Blindly insert all new orders into the cache.
+        // Insert new / updated orders or remove invalidated orders
+        // and the associated quote.
         for (uid, order) in next_orders {
-            current_orders.insert(uid, order);
-        }
-
-        // Filter out all the invalid orders.
-        current_orders.retain(|_uid, order| {
-            let expired = order.data.valid_to < min_valid_to
-                || order
-                    .metadata
-                    .ethflow_data
-                    .as_ref()
-                    .is_some_and(|data| data.user_valid_to < i64::from(min_valid_to));
-
             let invalidated = order.metadata.invalidated;
             let onchain_error = order
                 .metadata
@@ -619,10 +635,30 @@ impl Persistence {
                 }
             };
 
-            !expired && !invalidated && !onchain_error && !fulfilled
-        });
+            if invalidated || onchain_error || fulfilled {
+                current_orders.remove(&uid);
+                current_quotes.remove(&uid);
+            } else {
+                current_orders.insert(uid, order);
+            }
+        }
 
-        current_quotes.retain(|uid, _| current_orders.contains_key(uid));
+        // Filter out all the expired orders and their quotes.
+        current_orders.retain(|uid, order| {
+            let expired = order.data.valid_to < min_valid_to
+                || order
+                    .metadata
+                    .ethflow_data
+                    .as_ref()
+                    .is_some_and(|data| data.user_valid_to < i64::from(min_valid_to));
+
+            if expired {
+                current_quotes.remove(uid);
+                false
+            } else {
+                true
+            }
+        });
 
         {
             let _timer = Metrics::get()
@@ -648,7 +684,7 @@ impl Persistence {
                 let order_uid = domain::OrderUid(quote.order_uid.0);
                 match dto::quote::into_domain(quote) {
                     Ok(quote) => {
-                        current_quotes.insert(order_uid, quote);
+                        current_quotes.insert(order_uid, Arc::new(quote));
                     }
                     Err(err) => tracing::warn!(?order_uid, ?err, "failed to convert quote from db"),
                 }
@@ -946,63 +982,6 @@ impl Persistence {
         Ok(())
     }
 
-    /// Finds solvers that won `last_auctions_count` consecutive auctions but
-    /// never settled any of them. The current block is used to prevent
-    /// selecting auctions with deadline after the current block since they
-    /// still can be settled.
-    pub async fn find_non_settling_solvers(
-        &self,
-        last_auctions_count: u32,
-        current_block: u64,
-    ) -> anyhow::Result<Vec<eth::Address>> {
-        let mut ex = self.postgres.pool.acquire().await.context("acquire")?;
-        let _timer = Metrics::get()
-            .database_queries
-            .with_label_values(&["find_non_settling_solvers"])
-            .start_timer();
-
-        Ok(database::solver_competition_v2::find_non_settling_solvers(
-            &mut ex,
-            last_auctions_count,
-            current_block,
-        )
-        .await
-        .context("failed to fetch non-settling solvers")?
-        .into_iter()
-        .map(|solver| eth::Address(solver.0.into()))
-        .collect())
-    }
-
-    /// Finds solvers that have a failure settling rate above the given
-    /// ratio. The current block is used to prevent selecting auctions with
-    /// deadline after the current block since they still can be settled.
-    pub async fn find_low_settling_solvers(
-        &self,
-        last_auctions_count: u32,
-        current_block: u64,
-        max_failure_rate: f64,
-        min_wins_threshold: u32,
-    ) -> anyhow::Result<Vec<eth::Address>> {
-        let mut ex = self.postgres.pool.acquire().await.context("acquire")?;
-        let _timer = Metrics::get()
-            .database_queries
-            .with_label_values(&["find_low_settling_solvers"])
-            .start_timer();
-
-        Ok(database::solver_competition_v2::find_low_settling_solvers(
-            &mut ex,
-            last_auctions_count,
-            current_block,
-            max_failure_rate,
-            min_wins_threshold,
-        )
-        .await
-        .context("solver_competition::find_low_settling_solvers")?
-        .into_iter()
-        .map(|solver| eth::Address(solver.0.into()))
-        .collect())
-    }
-
     pub async fn get_solver_winning_solutions(
         &self,
         auction_id: domain::auction::Id,
@@ -1023,6 +1002,28 @@ impl Persistence {
             .await
             .context("solver_competition::fetch_solver_winning_solutions")?,
         )
+    }
+
+    /// Fetches orders which are currently inflight. Those orders should
+    /// be omitted from the current auction to avoid onchain reverts.
+    #[instrument(skip_all)]
+    pub async fn fetch_in_flight_orders(
+        &self,
+        current_block: u64,
+    ) -> anyhow::Result<HashSet<crate::domain::OrderUid>> {
+        let _timer = Metrics::get()
+            .database_queries
+            .with_label_values(&["inflight_orders"])
+            .start_timer();
+
+        let mut ex = self.postgres.pool.acquire().await.context("acquire")?;
+        let orders =
+            solver_competition_v2::fetch_in_flight_orders(&mut ex, current_block.cast_signed())
+                .await?;
+        Ok(orders
+            .into_iter()
+            .map(|o| crate::domain::OrderUid(o.0))
+            .collect())
     }
 }
 

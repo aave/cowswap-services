@@ -29,7 +29,7 @@ use {
     anyhow::Result,
     derive_more::{From, Into},
     num::BigRational,
-    observe::tracing::tracing_headers,
+    observe::tracing::distributed::headers::tracing_headers,
     reqwest::header::HeaderName,
     std::{
         collections::HashMap,
@@ -40,6 +40,7 @@ use {
 };
 
 pub mod dto;
+pub mod eip7702;
 
 // TODO At some point I should be checking that the names are unique, I don't
 // think I'm doing that.
@@ -138,6 +139,25 @@ impl TxSigner<Signature> for Account {
     }
 }
 
+impl Account {
+    /// Sign a hash using the underlying signer. Needed for EIP-7702
+    /// authorization signing which requires `Signer::sign_hash` rather than
+    /// `TxSigner::sign_transaction`.
+    pub async fn sign_hash(
+        &self,
+        hash: &alloy::primitives::B256,
+    ) -> alloy::signers::Result<Signature> {
+        use alloy::signers::Signer;
+        match self {
+            Account::PrivateKey(signer) => signer.sign_hash(hash).await,
+            Account::Kms(signer) => signer.sign_hash(hash).await,
+            Account::Address(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignHash,
+            )),
+        }
+    }
+}
+
 impl From<PrivateKeySigner> for Account {
     fn from(value: PrivateKeySigner) -> Self {
         Self::PrivateKey(value)
@@ -191,6 +211,13 @@ pub struct Config {
     /// economics to make competition bids more conservative. Does not modify
     /// interaction calldata. Default: 0 (no haircut).
     pub haircut_bps: u32,
+    /// Additional EOAs for parallel settlement submission via EIP-7702.
+    /// When non-empty, these accounts submit txs to the solver EOA (which
+    /// delegates to a forwarder contract), enabling concurrent submissions.
+    pub submission_accounts: Vec<Account>,
+    /// Address of the deployed CowSettlementForwarder contract for EIP-7702
+    /// delegation. Required when `submission_accounts` is non-empty.
+    pub forwarder_contract: Option<eth::Address>,
 }
 
 impl Solver {
@@ -287,6 +314,16 @@ impl Solver {
         self.config.haircut_bps
     }
 
+    /// Additional submission accounts for EIP-7702 parallel settlement.
+    pub fn submission_accounts(&self) -> &[Account] {
+        &self.config.submission_accounts
+    }
+
+    /// Address of the CowSettlementForwarder contract for EIP-7702 delegation.
+    pub fn forwarder_contract(&self) -> Option<eth::Address> {
+        self.config.forwarder_contract
+    }
+
     /// Make a POST request instructing the solver to solve an auction.
     /// Allocates at most `timeout` time for the solving.
     #[instrument(name = "solver_engine", skip_all)]
@@ -348,7 +385,7 @@ impl Solver {
             .body(body)
             .headers(tracing_headers())
             .timeout(timeout);
-        if let Some(id) = observe::distributed_tracing::request_id::from_current_span() {
+        if let Some(id) = observe::tracing::distributed::request_id::from_current_span() {
             req = req.header("X-REQUEST-ID", id);
         }
         super::observe::sending_solve_request(
@@ -443,13 +480,15 @@ impl Solver {
         let url = shared::url::join(&self.config.endpoint, "notify");
         super::observe::solver_request(&url, &body);
         let mut req = self.client.post(url).body(body).headers(tracing_headers());
-        if let Some(id) = observe::distributed_tracing::request_id::from_current_span() {
+        if let Some(id) = observe::tracing::distributed::request_id::from_current_span() {
             req = req.header("X-REQUEST-ID", id);
         }
         let response_size = self.config.response_size_limit_max_bytes;
         let future = async move {
-            if let Err(error) = util::http::send(response_size, req).await {
-                tracing::warn!(?error, "failed to notify solver");
+            if let Err(error) = util::http::send(response_size, req).await
+                && !matches!(error, util::http::Error::NotOk { code: 404, .. })
+            {
+                tracing::debug!(?error, "failed to notify solver");
             }
         };
         tokio::task::spawn(future.in_current_span());

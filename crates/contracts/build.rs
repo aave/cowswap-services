@@ -667,6 +667,7 @@ fn main() {
             AVALANCHE => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
         ]))
         .add_contract(Contract::new("ICowWrapper"))
+        .add_contract(Contract::new("CowSettlementForwarder"))
         .add_contract(Contract::new("ChainalysisOracle").with_networks(networks![
             MAINNET => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
             MAINNET_FORK => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
@@ -1033,7 +1034,7 @@ impl Contract {
         let module_name_ident = format_ident!("{}", self.name);
         let instance_name_ident = format_ident!("{}Instance", self.name);
         let instance = quote::quote! {
-            pub type Instance = #module_name_ident :: #instance_name_ident<::alloy::providers::DynProvider>;
+            pub type Instance = #module_name_ident :: #instance_name_ident<::alloy_provider::DynProvider>;
         };
         expansion.extend(instance);
 
@@ -1049,10 +1050,8 @@ impl Contract {
                         collections::HashMap
                     },
                     anyhow::{Result, Context},
-                    alloy::{
-                        providers::{Provider, DynProvider},
-                        primitives::{address, Address},
-                    },
+                    alloy_provider::{Provider, DynProvider},
+                    alloy_primitives::{address, Address},
                 };
 
                 pub const fn deployment_info(chain_id: u64) -> Option<(Address, Option<u64>)> {
@@ -1063,7 +1062,7 @@ impl Contract {
                 }
 
                 /// Returns the contract's deployment address (if one exists) for the given chain.
-                pub const fn deployment_address(chain_id: &u64) -> Option<::alloy::primitives::Address> {
+                pub const fn deployment_address(chain_id: &u64) -> Option<alloy_primitives::Address> {
                     match deployment_info(*chain_id) {
                         Some((address, _)) => Some(address),
                         None => None,
@@ -1143,13 +1142,15 @@ fn generate_binding(instance: &mut SolMacroGen, all_derives: bool) -> anyhow::Re
         SolInputKind::Sol(mut file) => {
             let sol_attr: syn::Attribute = if all_derives {
                 syn::parse_quote! {
-                        #[sol(rpc, alloy_sol_types = alloy::sol_types, alloy_contract =
-                alloy::contract, all_derives = true, extra_derives(serde::Serialize,
-                serde::Deserialize))]     }
+                    #[sol(
+                        rpc,
+                        all_derives = true,
+                        extra_derives(serde::Serialize,
+                        serde::Deserialize)
+                    )]
+                }
             } else {
-                syn::parse_quote! {
-                        #[sol(rpc, alloy_sol_types = alloy::sol_types, alloy_contract =
-                alloy::contract)]     }
+                syn::parse_quote! { #[sol(rpc)] }
             };
             file.attrs.push(sol_attr);
             expand(file)?
@@ -1185,7 +1186,7 @@ fn write_mod_name(contents: &mut String, name: &str) -> anyhow::Result<()> {
 /// quote::quote! {
 ///     pub const fn deployment_info(chain_id: u64) -> Option<(Address, Option<u64>)> {
 ///         match chain_id {
-///             #(#chain_id => Some((::alloy::primitives::address!(#address), #block_number)),)*
+///             #(#chain_id => Some((alloy_primitives::address!(#address), #block_number)),)*
 ///             _ => None
 ///         }
 ///     }
@@ -1216,7 +1217,7 @@ impl ToTokens for NetworkArm {
             None => quote::quote! {None},
         };
         tokens.extend(quote::quote! {
-           #chain_id => Some((::alloy::primitives::address!(#address), #block_number))
+           #chain_id => Some((alloy_primitives::address!(#address), #block_number))
         });
     }
 }

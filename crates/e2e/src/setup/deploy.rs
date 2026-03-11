@@ -1,7 +1,8 @@
 use {
     alloy::{
-        primitives::{Address, B256, U256},
+        primitives::{Address, B256, U256, keccak256},
         providers::Provider,
+        sol_types::SolCall,
     },
     contracts::alloy::{
         BalancerV2Authorizer,
@@ -18,7 +19,7 @@ use {
     },
     ethrpc::alloy::CallBuilderExt,
     model::DomainSeparator,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
 };
 
 #[derive(Default)]
@@ -47,48 +48,50 @@ pub struct Contracts {
 impl Contracts {
     pub async fn deployed_with(web3: &Web3, deployed: DeployedContracts) -> Self {
         let network_id = web3
-            .alloy
+            .provider
             .get_chain_id()
             .await
             .expect("get network ID failed")
             .to_string();
         tracing::info!("connected to forked test network {}", network_id);
 
-        let gp_settlement = GPv2Settlement::Instance::deployed(&web3.alloy)
+        let gp_settlement = GPv2Settlement::Instance::deployed(&web3.provider)
             .await
             .unwrap();
         let balances = match deployed.balances {
-            Some(address) => Balances::Instance::new(address, web3.alloy.clone()),
-            None => Balances::Instance::deployed(&web3.alloy)
+            Some(address) => Balances::Instance::new(address, web3.provider.clone()),
+            None => Balances::Instance::deployed(&web3.provider)
                 .await
                 .expect("failed to find balances contract"),
         };
         let signatures = match deployed.signatures {
-            Some(address) => Signatures::Instance::new(address, web3.alloy.clone()),
-            None => Signatures::Instance::deployed(&web3.alloy)
+            Some(address) => Signatures::Instance::new(address, web3.provider.clone()),
+            None => Signatures::Instance::deployed(&web3.provider)
                 .await
                 .expect("failed to find signatures contract"),
         };
 
-        let flashloan_router = FlashLoanRouter::Instance::deployed(&web3.alloy).await.ok();
+        let flashloan_router = FlashLoanRouter::Instance::deployed(&web3.provider)
+            .await
+            .ok();
 
         Self {
             chain_id: network_id
                 .parse()
                 .expect("Couldn't parse network ID to u64"),
-            balancer_vault: BalancerV2Vault::Instance::deployed(&web3.alloy)
+            balancer_vault: BalancerV2Vault::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
-            gp_authenticator: GPv2AllowListAuthentication::Instance::deployed(&web3.alloy)
+            gp_authenticator: GPv2AllowListAuthentication::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
-            uniswap_v2_factory: UniswapV2Factory::Instance::deployed(&web3.alloy)
+            uniswap_v2_factory: UniswapV2Factory::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
-            uniswap_v2_router: UniswapV2Router02::Instance::deployed(&web3.alloy)
+            uniswap_v2_router: UniswapV2Router02::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
-            weth: WETH9::Instance::deployed(&web3.alloy).await.unwrap(),
+            weth: WETH9::Instance::deployed(&web3.provider).await.unwrap(),
             allowance: gp_settlement
                 .vaultRelayer()
                 .call()
@@ -103,11 +106,11 @@ impl Contracts {
                     .0,
             ),
             ethflows: vec![
-                CoWSwapEthFlow::Instance::deployed(&web3.alloy)
+                CoWSwapEthFlow::Instance::deployed(&web3.provider)
                     .await
                     .unwrap(),
             ],
-            hooks: HooksTrampoline::Instance::deployed(&web3.alloy)
+            hooks: HooksTrampoline::Instance::deployed(&web3.provider)
                 .await
                 .unwrap(),
             gp_settlement,
@@ -119,7 +122,7 @@ impl Contracts {
 
     pub async fn deploy(web3: &Web3) -> Self {
         let network_id = web3
-            .alloy
+            .provider
             .get_chain_id()
             .await
             .expect("get network ID failed")
@@ -127,19 +130,22 @@ impl Contracts {
         tracing::info!("connected to test network {}", network_id);
 
         let accounts = web3
-            .alloy
+            .provider
             .get_accounts()
             .await
             .expect("get accounts failed");
         let admin = accounts[0];
 
-        let weth = WETH9::Instance::deploy(web3.alloy.clone()).await.unwrap();
-
-        let balancer_authorizer = BalancerV2Authorizer::Instance::deploy(web3.alloy.clone(), admin)
+        let weth = WETH9::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
+
+        let balancer_authorizer =
+            BalancerV2Authorizer::Instance::deploy(web3.provider.clone(), admin)
+                .await
+                .unwrap();
         let balancer_vault = BalancerV2Vault::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *balancer_authorizer.address(),
             *weth.address(),
             U256::ZERO,
@@ -148,18 +154,18 @@ impl Contracts {
         .await
         .unwrap();
 
-        let uniswap_v2_factory = UniswapV2Factory::Instance::deploy(web3.alloy.clone(), admin)
+        let uniswap_v2_factory = UniswapV2Factory::Instance::deploy(web3.provider.clone(), admin)
             .await
             .unwrap();
         let uniswap_v2_router = UniswapV2Router02::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *uniswap_v2_factory.address(),
             *weth.address(),
         )
         .await
         .unwrap();
 
-        let gp_authenticator = GPv2AllowListAuthentication::Instance::deploy(web3.alloy.clone())
+        let gp_authenticator = GPv2AllowListAuthentication::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
         gp_authenticator
@@ -168,20 +174,20 @@ impl Contracts {
             .await
             .expect("failed to initialize manager");
         let gp_settlement = GPv2Settlement::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *gp_authenticator.address(),
             *balancer_vault.address(),
         )
         .await
         .unwrap();
-        let balances = Balances::Instance::deploy(web3.alloy.clone())
+        let balances = Balances::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
-        let signatures = Signatures::Instance::deploy(web3.alloy.clone())
+        let signatures = Signatures::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
 
-        contracts::vault::grant_required_roles(
+        grant_required_roles(
             &balancer_authorizer,
             *balancer_vault.address(),
             gp_settlement
@@ -190,8 +196,7 @@ impl Contracts {
                 .await
                 .expect("failed to retrieve Vault relayer contract address"),
         )
-        .await
-        .expect("failed to authorize Vault relayer");
+        .await;
 
         let allowance = gp_settlement
             .vaultRelayer()
@@ -208,24 +213,25 @@ impl Contracts {
         );
 
         let ethflow = CoWSwapEthFlow::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *gp_settlement.address(),
             *weth.address(),
         )
         .await
         .unwrap();
         let ethflow_secondary = CoWSwapEthFlow::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *gp_settlement.address(),
             *weth.address(),
         )
         .await
         .unwrap();
-        let hooks = HooksTrampoline::Instance::deploy(web3.alloy.clone(), *gp_settlement.address())
-            .await
-            .unwrap();
+        let hooks =
+            HooksTrampoline::Instance::deploy(web3.provider.clone(), *gp_settlement.address())
+                .await
+                .unwrap();
         let flashloan_router =
-            FlashLoanRouter::Instance::deploy(web3.alloy.clone(), *gp_settlement.address())
+            FlashLoanRouter::Instance::deploy(web3.provider.clone(), *gp_settlement.address())
                 .await
                 .unwrap();
 
@@ -252,8 +258,41 @@ impl Contracts {
 
     pub fn default_pool_code(&self) -> B256 {
         match self.chain_id {
-            100 => B256::new(shared::sources::uniswap_v2::HONEYSWAP_INIT),
-            _ => B256::new(shared::sources::uniswap_v2::UNISWAP_INIT),
+            100 => B256::new(liquidity_sources::uniswap_v2::HONEYSWAP_INIT),
+            _ => B256::new(liquidity_sources::uniswap_v2::UNISWAP_INIT),
         }
     }
+}
+
+fn role_id<Call: SolCall>(vault: Address) -> B256 {
+    let mut data = [0u8; 36];
+    data[12..32].copy_from_slice(vault.as_slice());
+    data[32..36].copy_from_slice(&Call::SELECTOR);
+    keccak256(data)
+}
+
+async fn grant_required_roles(
+    authorizer: &BalancerV2Authorizer::Instance,
+    vault: Address,
+    vault_relayer: Address,
+) {
+    use contracts::alloy::BalancerV2Vault::BalancerV2Vault::{
+        batchSwapCall,
+        manageUserBalanceCall,
+    };
+
+    authorizer
+        .grantRoles(
+            vec![
+                role_id::<manageUserBalanceCall>(vault).0.into(),
+                role_id::<batchSwapCall>(vault).0.into(),
+            ],
+            vault_relayer,
+        )
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
 }

@@ -1,5 +1,10 @@
 use {
-    ::alloy::primitives::U256,
+    ::alloy::primitives::{U256, address},
+    autopilot::config::{
+        Configuration,
+        solver::{Account, Solver},
+    },
+    configs::test_util::TestDefault,
     e2e::setup::{colocation::SolverEngine, mock::Mock, *},
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -7,9 +12,10 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
     solvers_dto::solution::Solution,
-    std::collections::HashMap,
+    std::{collections::HashMap, str::FromStr},
+    url::Url,
 };
 
 #[tokio::test]
@@ -80,17 +86,28 @@ async fn solver_competition(web3: Web3) {
     );
 
     let services = Services::new(&onchain).await;
+
     services.start_autopilot(
         None,
         vec![
-            format!("--drivers=test_solver|http://localhost:11088/test_solver|{},solver2|http://localhost:11088/solver2|{}", const_hex::encode(solver.address()), const_hex::encode(solver.address())
-            ),
             "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver,solver2|http://localhost:11088/solver2".to_string(),
         ],
+        Configuration {
+            drivers: vec![
+                Solver::test("test_solver", solver.address()),
+                Solver::test("solver2", solver.address()),
+            ],
+            ..Configuration::test_no_drivers()
+        }
     ).await;
-    services.start_api(vec![
-        "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver,solver2|http://localhost:11088/solver2".to_string(),
-    ]).await;
+    services
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver,solver2|http://localhost:11088/solver2".to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
+        .await;
 
     // Place Order
     let order = OrderCreation {
@@ -220,18 +237,35 @@ async fn wrong_solution_submission_address(web3: Web3) {
     );
 
     let services = Services::new(&onchain).await;
-    services.start_autopilot(
-        None,
-        // Solver 1 has a wrong submission address, meaning that the solutions should be discarded from solver1
-        vec![
-            format!("--drivers=solver1|http://localhost:11088/test_solver|0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,solver2|http://localhost:11088/solver2|{}", const_hex::encode(solver.address())),
-            "--price-estimation-drivers=solver1|http://localhost:11088/test_solver".to_string(),
-        ],
-    ).await;
+
     services
-        .start_api(vec![
-            "--price-estimation-drivers=solver1|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_autopilot(
+            None,
+            vec![
+                "--price-estimation-drivers=solver1|http://localhost:11088/test_solver".to_string(),
+            ],
+            Configuration {
+                drivers: vec![
+                    // Solver 1 has a wrong submission address, meaning that the solutions should
+                    // be discarded from solver1
+                    Solver::new(
+                        "solver1".to_string(),
+                        Url::from_str("http://localhost:11088/test_solver").unwrap(),
+                        Account::Address(address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
+                    ),
+                    Solver::test("solver2", solver.address()),
+                ],
+                ..Configuration::test_no_drivers()
+            },
+        )
+        .await;
+    services
+        .start_api(
+            vec![
+                "--price-estimation-drivers=solver1|http://localhost:11088/test_solver".to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Place Orders
@@ -326,8 +360,8 @@ async fn store_filtered_solutions(web3: Web3) {
 
     let services = Services::new(&onchain).await;
 
-    let good_solver = Mock::default();
-    let bad_solver = Mock::default();
+    let good_solver = Mock::new().await;
+    let bad_solver = Mock::new().await;
 
     // Start system
     let base_tokens = vec![*token_a.address(), *token_b.address(), *token_c.address()];
@@ -350,6 +384,8 @@ async fn store_filtered_solutions(web3: Web3) {
                 base_tokens: base_tokens.clone(),
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
             SolverEngine {
                 name: "bad_solver".into(),
@@ -358,6 +394,8 @@ async fn store_filtered_solutions(web3: Web3) {
                 base_tokens,
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
@@ -370,21 +408,27 @@ async fn store_filtered_solutions(web3: Web3) {
         .start_autopilot(
             None,
             vec![
-                format!(
-                    "--drivers=good_solver|http://localhost:11088/good_solver|{},bad_solver|http://localhost:11088/bad_solver|{}",
-                    const_hex::encode(good_solver_account.address()),
-                    const_hex::encode(bad_solver_account.address()),
-                ),
                 "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
                     .to_string(),
                 "--max-winners-per-auction=10".to_string(),
             ],
+            Configuration {
+                drivers: vec![
+                    Solver::test("good_solver", good_solver_account.address()),
+                    Solver::test("bad_solver", bad_solver_account.address()),
+                ],
+                ..Configuration::test_no_drivers()
+            },
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Place order

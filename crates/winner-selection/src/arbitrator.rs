@@ -11,7 +11,7 @@ use {
         solution::{Order, RankType, Ranked, Scored, Solution, Unscored},
         state::{RankedItem, ScoredItem, UnscoredItem},
     },
-    alloy::primitives::{Address, U256},
+    alloy_primitives::{Address, U256},
     anyhow::{Context, Result},
     itertools::{Either, Itertools},
     number::u256_ext::U256Ext,
@@ -19,6 +19,7 @@ use {
         cmp::Reverse,
         collections::{HashMap, HashSet},
     },
+    tracing::instrument,
 };
 
 /// Auction arbitrator responsible for selecting winning solutions.
@@ -33,6 +34,7 @@ impl Arbitrator {
     /// Runs the auction mechanism on solutions.
     ///
     /// Takes solutions and auction context, returns a ranking with winners.
+    #[instrument(skip_all)]
     pub fn arbitrate(
         &self,
         solutions: Vec<Solution<Unscored>>,
@@ -55,6 +57,7 @@ impl Arbitrator {
     }
 
     /// Removes unfair solutions from the set of all solutions.
+    #[instrument(skip_all)]
     fn partition_unfair_solutions(
         &self,
         solutions: Vec<Solution<Unscored>>,
@@ -245,7 +248,7 @@ impl Arbitrator {
                 // to avoid loss of precision because we work with integers we first multiply
                 // and then divide:
                 // buy_amount = surplus * buy_price / sell_price
-                use alloy::primitives::{U512, ruint::UintTryFrom};
+                use alloy_primitives::{U512, ruint::UintTryFrom};
 
                 let surplus_in_buy_tokens = surplus_in_surplus_token
                     .widening_mul(order.buy_amount)
@@ -611,6 +614,7 @@ impl Arbitrator {
     }
 
     /// Compute reference scores for winning solvers.
+    #[instrument(skip_all)]
     pub fn compute_reference_scores(&self, ranking: &Ranking) -> HashMap<Address, U256> {
         let mut reference_scores = HashMap::default();
 

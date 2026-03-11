@@ -148,7 +148,18 @@ INSERT INTO orders (
     class,
     true_valid_to
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+    -- Ethflow orders are inserted with valid_to set to u32::MAX. Their true validity is stored in
+    -- the ethflow_orders table.
+    -- If there already exists an Ethflow order with the same uid, take smaller of the two valid_to values
+    CASE 
+        WHEN $21 = 4294967295 THEN  -- u32::MAX
+            COALESCE((SELECT valid_to FROM ethflow_orders WHERE uid = $1), $21)
+        ELSE 
+            $21
+    END
+)
     "#;
 
 #[instrument(skip_all)]
@@ -633,6 +644,21 @@ COALESCE((SELECT executed_fee_token FROM order_execution oe WHERE oe.order_uid =
 "#;
 
 pub const FROM: &str = "orders o";
+const FULL_ORDER_WITH_QUOTE: &str = const_format::concatcp!(
+    "SELECT ",
+    SELECT,
+    ", o_quotes.sell_amount as quote_sell_amount",
+    ", o_quotes.buy_amount as quote_buy_amount",
+    ", o_quotes.gas_amount as quote_gas_amount",
+    ", o_quotes.gas_price as quote_gas_price",
+    ", o_quotes.sell_token_price as quote_sell_token_price",
+    ", o_quotes.verified as quote_verified",
+    ", o_quotes.metadata as quote_metadata",
+    ", o_quotes.solver as solver",
+    " FROM ",
+    FROM,
+    " LEFT JOIN order_quotes o_quotes ON o.uid = o_quotes.order_uid",
+);
 
 #[instrument(skip_all)]
 pub async fn single_full_order_with_quote(
@@ -641,20 +667,19 @@ pub async fn single_full_order_with_quote(
 ) -> Result<Option<FullOrderWithQuote>, sqlx::Error> {
     #[rustfmt::skip]
     const QUERY: &str = const_format::concatcp!(
-        "SELECT ", SELECT,
-        ", o_quotes.sell_amount as quote_sell_amount",
-        ", o_quotes.buy_amount as quote_buy_amount",
-        ", o_quotes.gas_amount as quote_gas_amount",
-        ", o_quotes.gas_price as quote_gas_price",
-        ", o_quotes.sell_token_price as quote_sell_token_price",
-        ", o_quotes.verified as quote_verified",
-        ", o_quotes.metadata as quote_metadata",
-        ", o_quotes.solver as solver",
-        " FROM ", FROM,
-        " LEFT JOIN order_quotes o_quotes ON o.uid = o_quotes.order_uid",
-        " WHERE o.uid = $1",
-        );
+        FULL_ORDER_WITH_QUOTE,
+        " WHERE o.uid = $1"
+    );
     sqlx::query_as(QUERY).bind(uid).fetch_optional(ex).await
+}
+
+#[instrument(skip_all)]
+pub async fn many_full_orders_with_quotes<'a>(
+    ex: &'a mut PgConnection,
+    order_ids: &'a [OrderUid],
+) -> Result<Vec<FullOrderWithQuote>, sqlx::Error> {
+    const QUERY: &str = const_format::concatcp!(FULL_ORDER_WITH_QUOTE, " WHERE o.uid = ANY($1)");
+    sqlx::query_as(QUERY).bind(order_ids).fetch_all(ex).await
 }
 
 // Partial query for getting the log indices of events of a single settlement.
@@ -721,26 +746,24 @@ pub fn solvable_orders(
     /// - pending pre-signature
     /// - ethflow specific invalidation conditions
     const OPEN_ORDERS: &str = r#"
-    WITH live_orders AS (
+    WITH live_orders AS MATERIALIZED (
         SELECT o.*
         FROM   orders o
-        LEFT   JOIN ethflow_orders e ON e.uid = o.uid
         WHERE  o.cancellation_timestamp IS NULL
-          AND  o.valid_to >= $1
-          AND (e.valid_to IS NULL OR e.valid_to >= $1)
-          AND NOT EXISTS (SELECT 1 FROM invalidations               i  WHERE i.order_uid = o.uid)
-          AND NOT EXISTS (SELECT 1 FROM onchain_order_invalidations oi WHERE oi.uid      = o.uid)
-          AND NOT EXISTS (SELECT 1 FROM onchain_placed_orders       op WHERE op.uid      = o.uid
-                                                                         AND op.placement_error IS NOT NULL)
+            AND o.true_valid_to >= $1
+            AND NOT EXISTS (SELECT 1 FROM invalidations i WHERE i.order_uid = o.uid)
+            AND NOT EXISTS (SELECT 1 FROM onchain_order_invalidations oi WHERE oi.uid = o.uid)
+            AND NOT EXISTS (SELECT 1 FROM onchain_placed_orders op WHERE op.uid = o.uid AND op.placement_error IS NOT NULL)
+            AND NOT EXISTS (SELECT 1 FROM ethflow_refunds r WHERE r.order_uid = o.uid)
     ),
     trades_agg AS (
-         SELECT t.order_uid,
-                SUM(t.buy_amount) AS sum_buy,
-                SUM(t.sell_amount) AS sum_sell,
-                SUM(t.fee_amount) AS sum_fee
-         FROM trades t
-         JOIN live_orders lo ON lo.uid = t.order_uid
-         GROUP BY t.order_uid
+        SELECT t.order_uid,
+            SUM(t.buy_amount) AS sum_buy,
+            SUM(t.sell_amount) AS sum_sell,
+            SUM(t.fee_amount) AS sum_fee
+        FROM trades t
+        JOIN live_orders lo ON lo.uid = t.order_uid
+        GROUP BY t.order_uid
     )
     SELECT
         lo.uid,
@@ -960,46 +983,39 @@ pub async fn user_orders_with_quote(
     owner: &Address,
 ) -> Result<Vec<OrderWithQuote>, sqlx::Error> {
     // Optimized version following the same pattern as OPEN_ORDERS
-    #[rustfmt::skip]
     const QUERY: &str = r#"
-WITH live_orders AS (
-    SELECT o.*
-    FROM   orders o
-    LEFT   JOIN ethflow_orders e ON e.uid = o.uid
-    WHERE  o.cancellation_timestamp IS NULL
-      AND  o.valid_to >= $1
-      AND (e.valid_to IS NULL OR e.valid_to >= $1)
-      AND NOT EXISTS (SELECT 1 FROM invalidations               i  WHERE i.order_uid = o.uid)
-      AND NOT EXISTS (SELECT 1 FROM onchain_order_invalidations oi WHERE oi.uid      = o.uid)
-      AND NOT EXISTS (SELECT 1 FROM onchain_placed_orders       op WHERE op.uid      = o.uid
-                                                                     AND op.placement_error IS NOT NULL)
-      AND  o.owner = $2
-      AND  o.class = 'limit'
-),
-trades_agg AS (
-     SELECT t.order_uid,
-            SUM(t.buy_amount) AS sum_buy,
-            SUM(t.sell_amount) AS sum_sell,
-            SUM(t.fee_amount) AS sum_fee
-     FROM trades t
-     JOIN live_orders lo ON lo.uid = t.order_uid
-     GROUP BY t.order_uid
-)
-SELECT
-    o_quotes.sell_amount as quote_sell_amount,
-    lo.sell_amount as order_sell_amount,
-    o_quotes.buy_amount as quote_buy_amount,
-    lo.buy_amount as order_buy_amount,
-    lo.kind as order_kind,
-    o_quotes.gas_amount as quote_gas_amount,
-    o_quotes.gas_price as quote_gas_price,
-    o_quotes.sell_token_price as quote_sell_token_price
-FROM live_orders lo
-LEFT JOIN trades_agg ta ON  ta.order_uid = lo.uid
-INNER JOIN order_quotes o_quotes ON lo.uid = o_quotes.order_uid
-WHERE ((lo.kind = 'sell' AND COALESCE(ta.sum_sell,0) < lo.sell_amount) OR
-       (lo.kind = 'buy'  AND COALESCE(ta.sum_buy ,0) < lo.buy_amount))
-"#;
+    WITH live_orders AS (
+        SELECT o.*
+        FROM   orders o
+        WHERE  o.cancellation_timestamp IS NULL
+            AND o.true_valid_to >= $1
+            AND NOT EXISTS (SELECT 1 FROM ethflow_refunds r WHERE r.order_uid = o.uid)
+            AND NOT EXISTS (SELECT 1 FROM invalidations i WHERE i.order_uid = o.uid)
+            AND NOT EXISTS (SELECT 1 FROM onchain_order_invalidations oi WHERE oi.uid = o.uid)
+            AND NOT EXISTS (SELECT 1 FROM onchain_placed_orders op WHERE op.uid = o.uid AND op.placement_error IS NOT NULL)
+            AND NOT EXISTS (SELECT 1 FROM ethflow_refunds r WHERE r.order_uid = o.uid)
+            AND  o.owner = $2
+            AND  o.class = 'limit'
+    )
+    SELECT
+        o_quotes.sell_amount  AS quote_sell_amount,
+        lo.sell_amount        AS order_sell_amount,
+        o_quotes.buy_amount   AS quote_buy_amount,
+        lo.buy_amount         AS order_buy_amount,
+        lo.kind               AS order_kind,
+        o_quotes.gas_amount   AS quote_gas_amount,
+        o_quotes.gas_price    AS quote_gas_price,
+        o_quotes.sell_token_price AS quote_sell_token_price
+    FROM live_orders lo
+    INNER JOIN order_quotes o_quotes ON lo.uid = o_quotes.order_uid
+    WHERE (
+        lo.kind = 'sell'
+        AND COALESCE((SELECT SUM(sell_amount) FROM trades WHERE order_uid = lo.uid), 0) < lo.sell_amount
+    ) OR (
+        lo.kind = 'buy'
+        AND COALESCE((SELECT SUM(buy_amount) FROM trades WHERE order_uid = lo.uid), 0) < lo.buy_amount
+    );
+    "#;
     sqlx::query_as::<_, OrderWithQuote>(QUERY)
         .bind(min_valid_to)
         .bind(owner)

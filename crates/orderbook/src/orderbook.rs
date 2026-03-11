@@ -494,6 +494,10 @@ impl Orderbook {
         self.database_replica.single_order(uid).await
     }
 
+    pub async fn get_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>> {
+        self.database_replica.many_orders(uids).await
+    }
+
     pub async fn get_orders_for_tx(&self, hash: &B256) -> Result<Vec<Order>> {
         self.database_replica.orders_for_tx(hash).await
     }
@@ -684,7 +688,8 @@ mod tests {
                 ))
             });
 
-        let database = crate::database::Postgres::try_new("postgresql://").unwrap();
+        let database =
+            crate::database::Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&database.pool).await.unwrap();
         database.insert_order(&old_order).await.unwrap();
 

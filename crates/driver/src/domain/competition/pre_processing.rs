@@ -8,9 +8,15 @@ use {
             liquidity,
         },
         infra::{self, api::routes::solve::dto::SolveRequest, observe::metrics, tokens},
-        util::Bytes,
     },
+    account_balances::{BalanceFetching, Query},
+    alloy::primitives::{Bytes, FixedBytes},
     anyhow::{Context, Result},
+    axum::{
+        body::{self, Body},
+        http::Request,
+    },
+    balance_overrides::BalanceOverrideRequest,
     chrono::Utc,
     futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered},
     itertools::Itertools,
@@ -19,14 +25,15 @@ use {
         order::{OrderKind, SellTokenSource},
         signature::Signature,
     },
-    shared::{
-        account_balances::{BalanceFetching, Query},
-        price_estimation::trade_verifier::balance_overrides::BalanceOverrideRequest,
-        signature_validator::SignatureValidating,
+    signature_validator::SignatureValidating,
+    std::{
+        collections::HashMap,
+        future::Future,
+        sync::Arc,
+        time::{Duration, Instant},
     },
-    std::{collections::HashMap, future::Future, sync::Arc, time::Duration},
     tokio::sync::Mutex,
-    tracing::Instrument,
+    tracing::{Instrument, instrument},
 };
 
 type Shared<T> = futures::future::Shared<BoxFuture<'static, T>>;
@@ -73,7 +80,7 @@ impl std::fmt::Debug for Utilities {
 #[derive(Debug)]
 struct ControlBlock {
     /// Auction for which the data aggregation task was spawned.
-    solve_request: Arc<String>,
+    auction_id: i64,
     /// Data aggregation task.
     tasks: DataFetchingTasks,
 }
@@ -90,26 +97,34 @@ impl DataAggregator {
     /// only once for all connected solvers to share.
     pub async fn start_or_get_tasks_for_auction(
         &self,
-        request: Arc<String>,
+        request: Request<Body>,
     ) -> Result<DataFetchingTasks> {
         let mut lock = self.control.lock().await;
-        let current_auction = &lock.solve_request;
+        let current_auction = &lock.auction_id;
 
-        // The autopilot ensures that all drivers receive identical
-        // requests per auction. That means we can use the significantly
-        // cheaper string comparison instead of parsing the JSON to compare
-        // the auction ids.
-        if &request == current_auction {
-            let id = lock.tasks.auction.clone().await.id;
-            init_auction_id_in_span(id.map(|i| i.0));
+        // Figure out for which auction this `/solve` request was issued
+        // by looking at the `X-Auction-Id` header.
+        let request_auction_id: i64 = request
+            .headers()
+            .get("X-Auction-Id")
+            .context("request has no X-Auction-Id header")?
+            .to_str()
+            .context("X-Auction-Id header is not ASCII")?
+            .parse()
+            .context("could not parse X-Auction-Id header as i64")?;
+
+        // Some other driver is already doing the pre-processing for this
+        // auction. Stop processing here and just await the existing task.
+        if request_auction_id == *current_auction {
+            init_auction_id_in_span(Some(request_auction_id));
             tracing::debug!("await running data aggregation task");
             return Ok(lock.tasks.clone());
         }
 
-        let tasks = self.assemble_tasks(request.clone()).await?;
+        let tasks = self.assemble_tasks(request).await?;
 
         tracing::debug!("started new data aggregation task");
-        lock.solve_request = request;
+        lock.auction_id = request_auction_id;
         lock.tasks = tasks.clone();
 
         Ok(tasks)
@@ -122,9 +137,9 @@ impl DataAggregator {
         tokens: tokens::Fetcher,
         balance_fetcher: Arc<dyn BalanceFetching>,
     ) -> Self {
-        let signature_validator = shared::signature_validator::validator(
+        let signature_validator = signature_validator::validator(
             eth.web3(),
-            shared::signature_validator::Contracts {
+            signature_validator::Contracts {
                 settlement: eth.contracts().settlement().clone(),
                 vault_relayer: eth.contracts().vault_relayer().0,
                 signatures: eth.contracts().signatures().clone(),
@@ -139,7 +154,7 @@ impl DataAggregator {
             .map(|(factory, helper)| (factory.0, helper.0))
             .collect();
         let cow_amm_cache =
-            cow_amm::Cache::new(eth.web3().alloy.clone(), cow_amm_helper_by_factory);
+            cow_amm::Cache::new(eth.web3().provider.clone(), cow_amm_helper_by_factory);
 
         Self {
             utilities: Arc::new(Utilities {
@@ -152,7 +167,7 @@ impl DataAggregator {
                 cow_amm_cache,
             }),
             control: Mutex::new(ControlBlock {
-                solve_request: Default::default(),
+                auction_id: Default::default(),
                 tasks: DataFetchingTasks {
                     auction: futures::future::pending().boxed().shared(),
                     balances: futures::future::pending().boxed().shared(),
@@ -164,7 +179,7 @@ impl DataAggregator {
         }
     }
 
-    async fn assemble_tasks(&self, request: Arc<String>) -> Result<DataFetchingTasks> {
+    async fn assemble_tasks(&self, request: Request<Body>) -> Result<DataFetchingTasks> {
         let auction = self.utilities.parse_request(request).await?;
 
         let balances =
@@ -211,14 +226,16 @@ impl Utilities {
     /// Parses the JSON body of the `/solve` request during the unified
     /// auction pre-processing since eagerly deserializing these requests
     /// is surprisingly costly because their are so big.
-    async fn parse_request(&self, solve_request: Arc<String>) -> Result<Arc<Auction>> {
+    async fn parse_request(&self, solve_request: Request<Body>) -> Result<Arc<Auction>> {
+        let solve_request = collect_request_body(solve_request).await?;
+
         let auction_dto: SolveRequest = {
             let _timer = metrics::get().processing_stage_timer("parse_dto");
             let _timer2 =
                 observe::metrics::metrics().on_auction_overhead_start("driver", "parse_dto");
             // deserialization takes tens of milliseconds so run it on a blocking task
             tokio::task::spawn_blocking(move || {
-                serde_json::from_str(&solve_request).context("could not parse solve request")
+                serde_json::from_slice(&solve_request).context("could not parse solve request")
             })
             .await
             .context("failed to await blocking task")??
@@ -286,7 +303,7 @@ impl Utilities {
                             .map(|i| InteractionData {
                                 target: i.target,
                                 value: i.value.0,
-                                call_data: i.call_data.0.clone(),
+                                call_data: i.call_data.0.to_vec(),
                             })
                             .collect()
                     } else {
@@ -459,7 +476,8 @@ impl Utilities {
                     },
                     kind: order::Kind::Limit,
                     side: template.order.kind.into(),
-                    app_data: order::app_data::AppDataHash(Bytes(template.order.app_data.0)).into(),
+                    app_data: order::app_data::AppDataHash(FixedBytes(template.order.app_data.0))
+                        .into(),
                     buy_token_balance: template.order.buy_token_balance.into(),
                     sell_token_balance: template.order.sell_token_balance.into(),
                     partial: match template.order.partially_fillable {
@@ -484,7 +502,7 @@ impl Utilities {
                     signature: match template.signature {
                         Signature::Eip1271(bytes) => order::Signature {
                             scheme: order::signature::Scheme::Eip1271,
-                            data: Bytes(bytes),
+                            data: Bytes::from(bytes),
                             signer: amm,
                         },
                         _ => {
@@ -536,4 +554,20 @@ fn init_auction_id_in_span(id: Option<i64>) {
     let current_span = tracing::Span::current();
     debug_assert!(current_span.has_field("auction_id"));
     current_span.record("auction_id", id);
+}
+
+#[instrument(skip_all)]
+async fn collect_request_body(request: Request<Body>) -> Result<body::Bytes> {
+    tracing::trace!("start streaming request body");
+    let _timer =
+        observe::metrics::metrics().on_auction_overhead_start("driver", "stream_http_body");
+    let start = Instant::now();
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .context("failed to stream request body")?;
+
+    let duration = start.elapsed();
+    tracing::debug!(?duration, "finished streaming request body");
+    Ok(body_bytes)
 }

@@ -9,10 +9,8 @@ use {
         quote::QuoteId,
         signature::{self, EcdsaSignature, EcdsaSigningScheme, Signature},
     },
-    alloy::{
-        primitives::{Address, B256, U256, U512, b256, keccak256},
-        signers::local::PrivateKeySigner,
-    },
+    alloy_primitives::{Address, B256, U256, U512, b256, keccak256},
+    alloy_signer_local::PrivateKeySigner,
     anyhow::{Result, anyhow},
     app_data::{AppDataHash, hash_full_app_data},
     bigdecimal::BigDecimal,
@@ -100,12 +98,12 @@ impl OrderBuilder {
         self
     }
 
-    pub fn with_sell_amount(mut self, sell_amount: alloy::primitives::U256) -> Self {
+    pub fn with_sell_amount(mut self, sell_amount: U256) -> Self {
         self.0.data.sell_amount = sell_amount;
         self
     }
 
-    pub fn with_buy_amount(mut self, buy_amount: alloy::primitives::U256) -> Self {
+    pub fn with_buy_amount(mut self, buy_amount: U256) -> Self {
         self.0.data.buy_amount = buy_amount;
         self
     }
@@ -125,7 +123,7 @@ impl OrderBuilder {
         self
     }
 
-    pub fn with_fee_amount(mut self, fee_amount: alloy::primitives::U256) -> Self {
+    pub fn with_fee_amount(mut self, fee_amount: U256) -> Self {
         self.0.data.fee_amount = fee_amount;
         self
     }
@@ -206,9 +204,9 @@ pub struct OrderData {
     #[serde(default)]
     pub receiver: Option<Address>,
     #[serde_as(as = "HexOrDecimalU256")]
-    pub sell_amount: alloy::primitives::U256,
+    pub sell_amount: U256,
     #[serde_as(as = "HexOrDecimalU256")]
-    pub buy_amount: alloy::primitives::U256,
+    pub buy_amount: U256,
     pub valid_to: u32,
     pub app_data: AppDataHash,
     /// Fees that will be taken in terms of `sell_token`.
@@ -217,7 +215,7 @@ pub struct OrderData {
     /// and should not be settled on their own.
     /// This is 0 for limit orders as their fee gets taken from the surplus.
     #[serde_as(as = "HexOrDecimalU256")]
-    pub fee_amount: alloy::primitives::U256,
+    pub fee_amount: U256,
     pub kind: OrderKind,
     pub partially_fillable: bool,
     #[serde(default)]
@@ -283,9 +281,9 @@ impl OrderData {
 /// sell token and buy `buy` amount of buy token. Additionally, `fee``
 /// denominated in the sell token needs to be payed.
 pub struct QuoteAmounts {
-    pub sell: alloy::primitives::U256,
-    pub buy: alloy::primitives::U256,
-    pub fee: alloy::primitives::U256,
+    pub sell: U256,
+    pub buy: U256,
+    pub fee: U256,
 }
 
 /// An order as provided to the POST order endpoint.
@@ -304,10 +302,10 @@ pub struct OrderCreation {
     pub receiver: Option<Address>,
     /// The *maximum* amount of `sell_token`s that may be sold.
     #[serde_as(as = "HexOrDecimalU256")]
-    pub sell_amount: alloy::primitives::U256,
+    pub sell_amount: U256,
     /// The *minimum* amount of `buy_token`s that should be bought.
     #[serde_as(as = "HexOrDecimalU256")]
-    pub buy_amount: alloy::primitives::U256,
+    pub buy_amount: U256,
     /// The block timestamp when the order can no longer be settled (UNIX
     /// timestamp in seconds).
     pub valid_to: u32,
@@ -317,7 +315,7 @@ pub struct OrderCreation {
     ///
     /// Deprecation note: orders with a non-zero `fee_amount` should be rejected
     /// by the API.
-    pub fee_amount: alloy::primitives::U256,
+    pub fee_amount: U256,
     /// The kind of order (i.e. sell or buy).
     pub kind: OrderKind,
     /// Whether the order can be carried out in multiple smaller trades, or it
@@ -731,7 +729,12 @@ pub struct OrderMetadata {
     pub quote: Option<OrderQuote>,
 }
 
-// uid as 56 bytes: 32 for orderDigest, 20 for ownerAddress and 4 for validTo
+/// OrderUid is 56 bytes. When hex encoded as 0x prefixes Json string it is 116.
+/// Chosen to be under the MAX_JSON_BODY_PAYLOAD size of 1024 * 16
+pub const ORDER_UID_LIMIT: usize = 128;
+
+/// Uid as 56 bytes: 32 for orderDigest, 20 for ownerAddress and 4 for validTo
+/// Should be readable from prefixed and non-prefixed hex!
 #[derive(Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct OrderUid(pub [u8; 56]);
 
@@ -767,8 +770,7 @@ impl FromStr for OrderUid {
 
     fn from_str(s: &str) -> Result<OrderUid, const_hex::FromHexError> {
         let mut value = [0u8; 56];
-        let s_without_prefix = s.strip_prefix("0x").unwrap_or(s);
-        const_hex::decode_to_slice(s_without_prefix, value.as_mut())?;
+        const_hex::decode_to_slice(s, value.as_mut())?;
         Ok(OrderUid(value))
     }
 }
@@ -823,11 +825,6 @@ impl<'de> Deserialize<'de> for OrderUid {
             where
                 E: de::Error,
             {
-                let s = s.strip_prefix("0x").ok_or_else(|| {
-                    de::Error::custom(format!(
-                        "{s:?} can't be decoded as hex uid because it does not start with '0x'"
-                    ))
-                })?;
                 let mut value = [0u8; 56];
                 const_hex::decode_to_slice(s, value.as_mut()).map_err(|err| {
                     de::Error::custom(format!("failed to decode {s:?} as hex uid: {err}"))
@@ -1062,7 +1059,7 @@ mod tests {
     use {
         super::*,
         crate::signature::{EcdsaSigningScheme, SigningScheme},
-        alloy::primitives::{address, b256},
+        alloy_primitives::{address, b256},
         chrono::TimeZone,
         hex_literal::hex,
         maplit::hashset,
@@ -1072,7 +1069,9 @@ mod tests {
 
     #[test]
     fn deserialization_and_back() {
-        let value = json!(
+        // Input JSON has v=0x01, which gets normalized to v=28 (0x1c) for Solidity
+        // ecrecover compatibility. Serialization then outputs v=0x1c.
+        let input_json = json!(
         {
             "creationDate": "1970-01-01T00:00:03Z",
             "owner": "0x0000000000000000000000000000000000000001",
@@ -1109,6 +1108,7 @@ mod tests {
             },
             "fullAppData": "123",
         });
+
         let signing_scheme = EcdsaSigningScheme::Eip712;
         let expected = Order {
             metadata: OrderMetadata {
@@ -1133,95 +1133,179 @@ mod tests {
                 sell_token: Address::with_last_byte(10),
                 buy_token: Address::with_last_byte(9),
                 receiver: Some(Address::with_last_byte(11)),
-                sell_amount: alloy::primitives::U256::ONE,
-                buy_amount: alloy::primitives::U256::ZERO,
+                sell_amount: U256::ONE,
+                buy_amount: U256::ZERO,
                 valid_to: u32::MAX,
                 app_data: AppDataHash(hex!(
                     "6000000000000000000000000000000000000000000000000000000000000007"
                 )),
-                fee_amount: alloy::primitives::U256::MAX,
+                fee_amount: U256::MAX,
                 kind: OrderKind::Buy,
                 partially_fillable: false,
                 sell_token_balance: SellTokenSource::External,
                 buy_token_balance: BuyTokenDestination::Internal,
             },
             signature: EcdsaSignature {
-                v: 1,
+                // v=0x01 in input gets normalized to 28 for Solidity ecrecover compatibility
+                v: 28,
                 r: b256!("0200000000000000000000000000000000000000000000000000000000000003"),
                 s: b256!("0400000000000000000000000000000000000000000000000000000000000005"),
             }
             .to_signature(signing_scheme),
             interactions: Interactions::default(),
         };
-        let deserialized: Order = serde_json::from_value(value.clone()).unwrap();
+
+        // After deserialization, v=0x01 becomes v=28
+        let deserialized: Order = serde_json::from_value(input_json).unwrap();
         assert_eq!(deserialized, expected);
+
+        // Serialization outputs the normalized v=0x1c (28)
+        let expected_output_json = json!(
+        {
+            "creationDate": "1970-01-01T00:00:03Z",
+            "owner": "0x0000000000000000000000000000000000000001",
+            "uid": "0x1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            "availableBalance": null,
+            "executedBuyAmount": "3",
+            "executedSellAmount": "5",
+            "executedSellAmountBeforeFees": "4",
+            "executedFeeAmount": "1",
+            "invalidated": true,
+            "sellToken": "0x000000000000000000000000000000000000000a",
+            "buyToken": "0x0000000000000000000000000000000000000009",
+            "receiver": "0x000000000000000000000000000000000000000b",
+            "sellAmount": "1",
+            "buyAmount": "0",
+            "validTo": 4294967295u32,
+            "appData": "0x6000000000000000000000000000000000000000000000000000000000000007",
+            "feeAmount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+            "executedFee": "1",
+            "executedFeeToken": "0x000000000000000000000000000000000000000a",
+            "kind": "buy",
+            "class": "limit",
+            "partiallyFillable": false,
+            "signature": "0x02000000000000000000000000000000000000000000000000000000000000030400000000000000000000000000000000000000000000000000000000000005\
+        1c",
+            "signingScheme": "eip712",
+            "status": "open",
+            "settlementContract": "0x0000000000000000000000000000000000000002",
+            "sellTokenBalance": "external",
+            "buyTokenBalance": "internal",
+            "isLiquidityOrder": false,
+            "interactions": {
+                    "pre": [],
+                    "post": [],
+            },
+            "fullAppData": "123",
+        });
         let serialized = serde_json::to_value(expected).unwrap();
-        assert_json_matches!(serialized, value);
+        assert_json_matches!(serialized, expected_output_json);
     }
 
     #[test]
     fn order_creation_serialization() {
         let owner = Address::repeat_byte(0xff);
-        for (signature, signing_scheme, from, signature_bytes) in [
-            (
-                Signature::default_with(SigningScheme::Eip712),
-                "eip712",
-                Some(owner),
-                "0x0000000000000000000000000000000000000000000000000000000000000000\
-                   0000000000000000000000000000000000000000000000000000000000000000\
-                   00",
-            ),
-            (
-                Signature::default_with(SigningScheme::EthSign),
-                "ethsign",
-                None,
-                "0x0000000000000000000000000000000000000000000000000000000000000000\
-                   0000000000000000000000000000000000000000000000000000000000000000\
-                   00",
-            ),
-            (Signature::PreSign, "presign", Some(owner), "0x"),
-        ] {
-            let order = OrderCreation {
-                sell_token: Address::repeat_byte(0x11),
-                buy_token: Address::repeat_byte(0x22),
-                receiver: Some(Address::repeat_byte(0x33)),
-                sell_amount: alloy::primitives::U256::from(123),
-                buy_amount: alloy::primitives::U256::from(456),
-                valid_to: 1337,
-                app_data: OrderCreationAppData::Hash {
-                    hash: AppDataHash([0x44; 32]),
-                },
-                fee_amount: alloy::primitives::U256::from(789),
-                kind: OrderKind::Sell,
-                partially_fillable: false,
-                sell_token_balance: SellTokenSource::Erc20,
-                buy_token_balance: BuyTokenDestination::Erc20,
-                from,
-                signature,
-                quote_id: Some(42),
-            };
-            let order_json = json!({
-                "sellToken": "0x1111111111111111111111111111111111111111",
-                "buyToken": "0x2222222222222222222222222222222222222222",
-                "receiver": "0x3333333333333333333333333333333333333333",
-                "sellAmount": "123",
-                "buyAmount": "456",
-                "validTo": 1337,
-                "appData": "0x4444444444444444444444444444444444444444444444444444444444444444",
-                "feeAmount": "789",
-                "kind": "sell",
-                "partiallyFillable": false,
-                "sellTokenBalance": "erc20",
-                "buyTokenBalance": "erc20",
-                "quoteId": 42,
-                "signingScheme": signing_scheme,
-                "signature": signature_bytes,
-                "from": from,
-            });
 
-            assert_json_matches!(json!(order), order_json);
-            assert_eq!(order, serde_json::from_value(order_json).unwrap());
-        }
+        let template_order = OrderCreation {
+            sell_token: Address::repeat_byte(0x11),
+            buy_token: Address::repeat_byte(0x22),
+            receiver: Some(Address::repeat_byte(0x33)),
+            sell_amount: U256::from(123),
+            buy_amount: U256::from(456),
+            valid_to: 1337,
+            app_data: OrderCreationAppData::Hash {
+                hash: AppDataHash([0x44; 32]),
+            },
+            fee_amount: U256::from(789),
+            kind: OrderKind::Sell,
+            partially_fillable: false,
+            sell_token_balance: SellTokenSource::Erc20,
+            buy_token_balance: BuyTokenDestination::Erc20,
+            from: Some(owner),
+            signature: Signature::PreSign,
+            quote_id: Some(42),
+        };
+
+        // Test PreSign round-trip (no signature normalization needed)
+        let presign_order = template_order.clone();
+        let presign_json = json!({
+            "sellToken": "0x1111111111111111111111111111111111111111",
+            "buyToken": "0x2222222222222222222222222222222222222222",
+            "receiver": "0x3333333333333333333333333333333333333333",
+            "sellAmount": "123",
+            "buyAmount": "456",
+            "validTo": 1337,
+            "appData": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "feeAmount": "789",
+            "kind": "sell",
+            "partiallyFillable": false,
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
+            "quoteId": 42,
+            "signingScheme": "presign",
+            "signature": "0x",
+            "from": owner,
+        });
+        assert_json_matches!(json!(presign_order), presign_json);
+        assert_eq!(presign_order, serde_json::from_value(presign_json).unwrap());
+
+        // Test ECDSA signature with v normalization.
+        // Input JSON has v=0x00, which normalizes to v=27 (0x1b).
+        let input_json_v0 = json!({
+            "sellToken": "0x1111111111111111111111111111111111111111",
+            "buyToken": "0x2222222222222222222222222222222222222222",
+            "receiver": "0x3333333333333333333333333333333333333333",
+            "sellAmount": "123",
+            "buyAmount": "456",
+            "validTo": 1337,
+            "appData": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "feeAmount": "789",
+            "kind": "sell",
+            "partiallyFillable": false,
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
+            "quoteId": 42,
+            "signingScheme": "eip712",
+            "signature": "0x0000000000000000000000000000000000000000000000000000000000000000\
+                          0000000000000000000000000000000000000000000000000000000000000000\
+                          00",
+            "from": owner,
+        });
+        let expected_order = OrderCreation {
+            signature: Signature::Eip712(EcdsaSignature {
+                r: B256::ZERO,
+                s: B256::ZERO,
+                v: 27, // normalized from v=0
+            }),
+            ..template_order.clone()
+        };
+
+        // Deserialization normalizes v=0 to v=27
+        let deserialized: OrderCreation = serde_json::from_value(input_json_v0).unwrap();
+        assert_eq!(deserialized, expected_order);
+
+        // Serialization outputs normalized v=0x1b
+        let output_json_v27 = json!({
+            "sellToken": "0x1111111111111111111111111111111111111111",
+            "buyToken": "0x2222222222222222222222222222222222222222",
+            "receiver": "0x3333333333333333333333333333333333333333",
+            "sellAmount": "123",
+            "buyAmount": "456",
+            "validTo": 1337,
+            "appData": "0x4444444444444444444444444444444444444444444444444444444444444444",
+            "feeAmount": "789",
+            "kind": "sell",
+            "partiallyFillable": false,
+            "sellTokenBalance": "erc20",
+            "buyTokenBalance": "erc20",
+            "quoteId": 42,
+            "signingScheme": "eip712",
+            "signature": "0x0000000000000000000000000000000000000000000000000000000000000000\
+                          0000000000000000000000000000000000000000000000000000000000000000\
+                          1b",
+            "from": owner,
+        });
+        assert_json_matches!(json!(expected_order), output_json_v27);
     }
 
     #[test]
@@ -1299,13 +1383,13 @@ mod tests {
                 sell_token: hex!("0101010101010101010101010101010101010101").into(),
                 buy_token: hex!("0202020202020202020202020202020202020202").into(),
                 receiver: Some(hex!("0303030303030303030303030303030303030303").into()),
-                sell_amount: alloy::primitives::U256::from(0x0246ddf97976680000_u128),
-                buy_amount: alloy::primitives::U256::from(0xb98bc829a6f90000_u128),
+                sell_amount: U256::from(0x0246ddf97976680000_u128),
+                buy_amount: U256::from(0xb98bc829a6f90000_u128),
                 valid_to: 0xffffffff,
                 app_data: AppDataHash(hex!(
                     "0000000000000000000000000000000000000000000000000000000000000000"
                 )),
-                fee_amount: alloy::primitives::U256::from(0x0de0b6b3a7640000_u128),
+                fee_amount: U256::from(0x0de0b6b3a7640000_u128),
                 kind: OrderKind::Sell,
                 partially_fillable: false,
                 sell_token_balance: SellTokenSource::Erc20,
@@ -1333,13 +1417,13 @@ mod tests {
             sell_token: hex!("0101010101010101010101010101010101010101").into(),
             buy_token: hex!("0202020202020202020202020202020202020202").into(),
             receiver: Some(hex!("0303030303030303030303030303030303030303").into()),
-            sell_amount: alloy::primitives::U256::from(0x0246ddf97976680000_u128),
-            buy_amount: alloy::primitives::U256::from(0xb98bc829a6f90000_u128),
+            sell_amount: U256::from(0x0246ddf97976680000_u128),
+            buy_amount: U256::from(0xb98bc829a6f90000_u128),
             valid_to: 0xffffffff,
             app_data: AppDataHash(hex!(
                 "0000000000000000000000000000000000000000000000000000000000000000"
             )),
-            fee_amount: alloy::primitives::U256::from(0x0de0b6b3a7640000_u128),
+            fee_amount: U256::from(0x0de0b6b3a7640000_u128),
             kind: OrderKind::Sell,
             partially_fillable: false,
             sell_token_balance: SellTokenSource::Erc20,
@@ -1379,7 +1463,7 @@ mod tests {
                 order_uid: OrderUid(hex!(
                     "2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"
                 )),
-                signature: EcdsaSignature::from_bytes(signature),
+                signature: EcdsaSignature::from_bytes(signature).unwrap(),
                 signing_scheme: *signing_scheme,
             };
             let owner = cancellation.validate(&domain_separator).unwrap();
@@ -1421,12 +1505,12 @@ mod tests {
 
         let order = OrderBuilder::default()
             .with_sell_token(Address::ZERO)
-            .with_sell_amount(alloy::primitives::U256::from(100))
+            .with_sell_amount(U256::from(100))
             .with_buy_token(Address::ZERO)
-            .with_buy_amount(alloy::primitives::U256::from(80))
+            .with_buy_amount(U256::from(80))
             .with_valid_to(u32::MAX)
             .with_app_data([1u8; 32])
-            .with_fee_amount(alloy::primitives::U256::from(1337))
+            .with_fee_amount(U256::from(1337))
             .with_partially_fillable(true)
             .with_sell_token_balance(SellTokenSource::External)
             .with_buy_token_balance(BuyTokenDestination::Internal)

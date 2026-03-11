@@ -1,5 +1,7 @@
 use {
     ::alloy::primitives::U256,
+    autopilot::config::trusted_tokens::TrustedTokensConfig,
+    configs::test_util::TestDefault,
     e2e::setup::*,
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -7,7 +9,7 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
 };
 
 #[tokio::test]
@@ -64,25 +66,30 @@ async fn onchain_settlement_without_liquidity(web3: Web3) {
         .start_autopilot(
             None,
             vec![
-                format!(
-                    "--trusted-tokens={weth:#x},{token_a:#x},{token_b:#x}",
-                    weth = onchain.contracts().weth.address(),
-                    token_a = token_a.address(),
-                    token_b = token_b.address()
-                ),
-                format!(
-                    "--drivers=test_solver|http://localhost:11088/test_solver|{}",
-                    const_hex::encode(solver.address())
-                ),
                 "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
                     .to_string(),
             ],
+            autopilot::config::Configuration {
+                trusted_tokens: TrustedTokensConfig {
+                    tokens: vec![
+                        *onchain.contracts().weth.address(),
+                        *token_a.address(),
+                        *token_b.address(),
+                    ],
+                    ..Default::default()
+                },
+                ..autopilot::config::Configuration::test("test_solver", solver.address())
+            },
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_quoter|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Place Order

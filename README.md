@@ -31,7 +31,7 @@ The `autopilot` connects to the same PostgreSQL database as the `orderbook` and 
 
 There are additional crates that live in the cargo workspace.
 
-- `contracts` provides _[ethcontract-rs](https://github.com/gnosis/ethcontract-rs)_ based smart contract bindings
+- `contracts` provides Alloy-based smart contract bindings
 - `database` provides the shared database and storage layer logic shared between the `autopilot` and `orderbook`
 - `driver` an in-development binary that intends to replace the `solver`; it has a slightly different design that allows co-location with external solvers
 - `e2e` end-to-end tests
@@ -161,3 +161,20 @@ You can also reset the log filter to the filter the program was initially starte
 
 See [here](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives) for documentation on the supported log filter format.
 
+## Formatting
+
+Rust code is formatted with `rustfmt` (nightly) and TOML files are formatted with [Tombi](https://tombi-toml.github.io/tombi/).
+
+```bash
+# Format Rust code
+just fmt
+
+# Format TOML files
+just fmt-toml
+
+# Check formatting without modifying files
+just fmt --check
+just fmt-toml --check
+```
+
+Editor extensions are available for [VS Code](https://marketplace.visualstudio.com/items?itemName=tombi-toml.tombi), [Zed](https://tombi-toml.github.io/tombi/docs/editors/zed-extension), and [JetBrains](https://plugins.jetbrains.com/plugin/28017-tombi).

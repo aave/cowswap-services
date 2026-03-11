@@ -16,6 +16,7 @@ use {
     alloy::{primitives::Address, signers::local::PrivateKeySigner},
     const_hex::ToHexExt,
     contracts::alloy::ERC20,
+    gas_price_estimation::Eip1559EstimationExt,
     itertools::Itertools,
     number::testing::ApproxEq,
     serde_json::{Value, json},
@@ -411,7 +412,7 @@ impl Solver {
             .flat_map(|f| {
                 let build_token = |token_name: String| async move {
                     let token = config.blockchain.get_token_wrapped(token_name.as_str());
-                    let contract = ERC20::Instance::new(token, config.blockchain.web3.alloy.clone());
+                    let contract = ERC20::Instance::new(token, config.blockchain.web3.provider.clone());
                     let settlement = config.blockchain.settlement.address();
                     (
                         token.encode_hex_with_prefix(),
@@ -488,14 +489,8 @@ impl Solver {
             axum::routing::post(
                 move |axum::extract::State(state): axum::extract::State<State>,
                  axum::extract::Json(req): axum::extract::Json<serde_json::Value>| async move {
-                    let effective_gas_price = eth
-                        .gas_price()
-                        .await
-                        .unwrap()
-                        .effective()
-                        .0
-                        .0
-                        .to_string();
+                    let base_fee = eth.current_block().borrow().base_fee;
+                    let effective_gas_price = eth.gas_price().await.unwrap().effective(base_fee).to_string();
                     let expected = json!({
                         "id": (!config.quote).then_some("1"),
                         "tokens": tokens_json,
@@ -519,10 +514,9 @@ impl Solver {
             ),
         )
         .with_state(State(state));
-        let server =
-            axum::Server::bind(&"0.0.0.0:0".parse().unwrap()).serve(app.into_make_service());
-        let addr = server.local_addr();
-        tokio::spawn(async move { server.await.unwrap() });
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self { addr }
     }
 }
@@ -558,11 +552,10 @@ fn check_solve_request(request: Value, expected: Value) {
         request.rest, expected.rest,
         "/solve request body does not match expectation"
     );
-
     assert!(
         request
             .effective_gas_price
-            .is_approx_eq(&expected.effective_gas_price, Some(15.0)),
+            .is_approx_eq(&expected.effective_gas_price, Some(1.0)), // 1.0%
     );
 }
 
