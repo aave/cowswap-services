@@ -422,15 +422,15 @@ impl OrderValidator {
         // even though the flashloan would provide the tokens during settlement.
         // In that case we fall back to this flag to bypass the check, matching
         // the behaviour from CoW services <= v2.327.0.
-        let has_flashloan_for_sell_token = app_data
-            .inner
-            .protocol
-            .flashloan
-            .as_ref()
-            .is_some_and(|loan| {
-                loan.token == order.data().sell_token
-                    && loan.amount >= order.data().sell_amount
-            });
+        let has_flashloan_for_sell_token =
+            app_data
+                .inner
+                .protocol
+                .flashloan
+                .as_ref()
+                .is_some_and(|loan| {
+                    loan.token == order.data().sell_token && loan.amount >= order.data().sell_amount
+                });
 
         // Simulate transferring a small token balance into the settlement contract.
         // As a spam protection we require that an account must have at least 1 atom
@@ -466,7 +466,10 @@ impl OrderValidator {
                     TransferSimulationError::InsufficientAllowance
                     | TransferSimulationError::InsufficientBalance
                     | TransferSimulationError::TransferFailed,
-                ) if order.signature == Signature::PreSign || has_wrappers || has_flashloan_for_sell_token => {
+                ) if order.signature == Signature::PreSign
+                    || has_wrappers
+                    || has_flashloan_for_sell_token =>
+                {
                     // Pre-sign orders do not require sufficient balance or allowance.
                     // The idea is that this allows smart contracts to place orders bundled with
                     // other transactions that either produce the required balance or set the

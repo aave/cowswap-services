@@ -156,7 +156,7 @@ pub async fn run(args: Arguments, config: Configuration) {
             .expect("load hooks trampoline contract"),
     };
 
-    if !args.skip_domain_separator_verification {
+    if !config.skip_domain_separator_verification {
         verify_deployed_contract_constants(&settlement_contract, chain_id)
             .await
             .expect("Deployed contract constants don't match the ones in this binary");

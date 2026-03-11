@@ -74,6 +74,11 @@ pub struct Configuration {
 
     #[serde(default)]
     pub database: DatabasePoolConfig,
+
+    /// Skip domain separator verification. Useful for forks where contracts
+    /// were deployed with a different chain ID.
+    #[serde(default)]
+    pub skip_domain_separator_verification: bool,
 }
 
 impl Configuration {
@@ -148,6 +153,7 @@ pub mod test_util {
                 // have the test_default trait impl
                 native_price_estimation: NativePriceConfig::test_default(),
                 database: TestDefault::test_default(),
+                skip_domain_separator_verification: Default::default(),
             }
         }
     }
@@ -295,6 +301,7 @@ mod tests {
                 ..NativePriceConfig::test_default()
             },
             database: TestDefault::test_default(),
+            skip_domain_separator_verification: false,
         };
 
         let serialized = toml::to_string_pretty(&config).unwrap();
