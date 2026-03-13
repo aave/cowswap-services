@@ -1,7 +1,8 @@
 use {
     crate::{
-        arguments::{Account, Arguments},
+        arguments::CliArguments,
         boundary,
+        config::{Configuration, solver::Account},
         database::{
             Postgres,
             ethflow_events::event_retriever::EthFlowRefundRetriever,
@@ -15,7 +16,7 @@ use {
                 event_retriever::CoWSwapOnchainOrdersContract,
             },
         },
-        domain::{self, competition::SolverParticipationGuard},
+        domain,
         event_updater::EventUpdater,
         infra,
         maintenance::Maintenance,
@@ -24,40 +25,33 @@ use {
         shutdown_controller::ShutdownController,
         solvable_orders::SolvableOrdersCache,
     },
+    account_balances::{self, BalanceSimulator},
     alloy::{eips::BlockNumberOrTag, primitives::Address, providers::Provider},
+    bad_tokens::list_based::DenyListedTokens,
     chain::Chain,
     clap::Parser,
-    contracts::alloy::{BalancerV2Vault, GPv2Settlement, IUniswapV3Factory, WETH9},
+    contracts::alloy::{BalancerV2Vault, GPv2Settlement, WETH9},
     ethrpc::{Web3, block_stream::block_number_to_block_number_hash},
-    futures::StreamExt,
+    event_indexing::block_retriever::BlockRetriever,
     model::DomainSeparator,
     num::ToPrimitive,
     observe::metrics::LivenessChecking,
+    price_estimation::{
+        factory::{self, PriceEstimatorFactory},
+        native::NativePriceEstimating,
+        trade_verifier::code_fetching::CachedCodeFetcher,
+    },
     shared::{
-        account_balances::{self, BalanceSimulator},
         arguments::tracing_config,
-        bad_token::{
-            cache::CachingDetector,
-            instrumented::InstrumentedBadTokenDetectorExt,
-            list_based::{ListBasedDetector, UnknownTokenStrategy},
-            token_owner_finder,
-            trace_call::TraceCallDetector,
-        },
-        baseline_solver::BaseTokens,
-        code_fetching::CachedCodeFetcher,
         http_client::HttpClientFactory,
-        maintenance::ServiceMaintenance,
         order_quoting::{self, OrderQuoter},
-        price_estimation::factory::{self, PriceEstimatorFactory},
-        signature_validator,
-        sources::{BaselineSource, uniswap_v2::UniV2BaselineSourceParameters},
-        token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
         token_list::{AutoUpdatingTokenList, TokenListConfiguration},
     },
     std::{
         sync::{Arc, RwLock, atomic::AtomicBool},
         time::{Duration, Instant},
     },
+    token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
     tracing::{Instrument, info_span, instrument},
     url::Url,
 };
@@ -91,7 +85,7 @@ impl Liveness {
 
 /// Creates Web3 transport based on the given config.
 #[instrument(skip_all)]
-async fn ethrpc(url: &Url, ethrpc_args: &shared::ethrpc::Arguments) -> infra::blockchain::Rpc {
+async fn ethrpc(url: &Url, ethrpc_args: &shared::web3::Arguments) -> infra::blockchain::Rpc {
     infra::blockchain::Rpc::new(url, ethrpc_args)
         .await
         .expect("connect ethereum RPC")
@@ -101,7 +95,7 @@ async fn ethrpc(url: &Url, ethrpc_args: &shared::ethrpc::Arguments) -> infra::bl
 async fn unbuffered_ethrpc(url: &Url) -> infra::blockchain::Rpc {
     ethrpc(
         url,
-        &shared::ethrpc::Arguments {
+        &shared::web3::Arguments {
             ethrpc_max_batch_size: 0,
             ethrpc_max_concurrent_requests: 0,
             ethrpc_batch_delay: Default::default(),
@@ -131,14 +125,21 @@ async fn ethereum(
 }
 
 pub async fn start(args: impl Iterator<Item = String>) {
-    let args = Arguments::parse_from(args);
+    let args = CliArguments::parse_from(args);
+
+    let config = Configuration::from_path(&args.config)
+        .await
+        .expect("failed to load configuration file")
+        .validate()
+        .expect("failed to validate configuration file");
+
     let obs_config = observe::Config::new(
         args.shared.logging.log_filter.as_str(),
         args.shared.logging.log_stderr_threshold,
         args.shared.logging.use_json_logs,
         tracing_config(&args.shared.tracing, "autopilot".into()),
     );
-    observe::tracing::initialize(&obs_config);
+    observe::tracing::init::initialize(&obs_config);
     observe::panic_hook::install();
     #[cfg(unix)]
     observe::heap_dump_handler::spawn_heap_dump_handler();
@@ -146,44 +147,48 @@ pub async fn start(args: impl Iterator<Item = String>) {
     let commit_hash = option_env!("VERGEN_GIT_SHA").unwrap_or("COMMIT_INFO_NOT_FOUND");
 
     tracing::info!(%commit_hash, "running autopilot with validated arguments:\n{}", args);
+    tracing::info!("file configuration:\n{:#?}", config);
 
     observe::metrics::setup_registry(Some("gp_v2_autopilot".into()), None);
 
-    if args.drivers.is_empty() {
-        panic!("colocation is enabled but no drivers are configured");
-    }
-
     if args.shadow.is_some() {
-        shadow_mode(args).await;
+        shadow_mode(args, config).await;
     } else {
-        run(args, ShutdownController::default()).await;
+        run(args, config, ShutdownController::default()).await;
     }
 }
 
 /// Assumes tracing and metrics registry have already been set up.
-pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
+pub async fn run(
+    args: CliArguments,
+    config: Configuration,
+    shutdown_controller: ShutdownController,
+) {
     assert!(args.shadow.is_none(), "cannot run in shadow mode");
-    let db_write = Postgres::new(args.db_write_url.as_str(), args.insert_batch_size)
-        .await
-        .unwrap();
+    let db_write = Postgres::new(
+        config.database.write_url.as_str(),
+        crate::database::Config {
+            insert_batch_size: config.database.insert_batch_size,
+            max_pool_size: config.database.max_connections,
+        },
+    )
+    .await
+    .unwrap();
 
     // If the DB is in read-only mode, running ANALYZE is not possible and will
     // trigger and error https://www.postgresql.org/docs/current/hot-standby.html
     crate::database::run_database_metrics_work(db_write.clone());
 
     let http_factory = HttpClientFactory::new(&args.http_client);
-    let web3 = shared::ethrpc::web3(
-        &args.shared.ethrpc,
-        &http_factory,
-        &args.shared.node_url,
-        "base",
-    );
-    let simulation_web3 = args.shared.simulation_node_url.as_ref().map(|node_url| {
-        shared::ethrpc::web3(&args.shared.ethrpc, &http_factory, node_url, "simulation")
-    });
+    let web3 = shared::web3::web3(&args.shared.ethrpc, &args.shared.node_url, "base");
+    let simulation_web3 = args
+        .shared
+        .simulation_node_url
+        .as_ref()
+        .map(|node_url| shared::web3::web3(&args.shared.ethrpc, node_url, "simulation"));
 
     let chain_id = web3
-        .alloy
+        .provider
         .get_chain_id()
         .instrument(info_span!("chain_id"))
         .await
@@ -236,27 +241,10 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         }
         addr
     });
-    let vault =
-        vault_address.map(|address| BalancerV2Vault::Instance::new(address, web3.alloy.clone()));
-
-    let uniswapv3_factory = IUniswapV3Factory::Instance::deployed(&web3.alloy)
-        .instrument(info_span!("uniswapv3_deployed"))
-        .await
-        .inspect_err(|err| tracing::warn!(%err, "error while fetching IUniswapV3Factory instance"))
-        .ok();
 
     let chain = Chain::try_from(chain_id).expect("incorrect chain ID");
 
     let balance_overrider = args.price_estimation.balance_overrides.init(web3.clone());
-    let signature_validator = signature_validator::validator(
-        &web3,
-        signature_validator::Contracts {
-            settlement: eth.contracts().settlement().clone(),
-            signatures: eth.contracts().signatures().clone(),
-            vault_relayer,
-        },
-        balance_overrider.clone(),
-    );
 
     let balance_fetcher = account_balances::cached(
         &web3,
@@ -271,8 +259,8 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     );
 
     let gas_price_estimator = Arc::new(
-        shared::gas_price_estimation::create_priority_estimator(
-            &http_factory,
+        gas_price_estimation::create_priority_estimator(
+            http_factory.create(),
             &web3,
             args.shared.gas_estimators.as_slice(),
         )
@@ -280,88 +268,21 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         .expect("failed to create gas price estimator"),
     );
 
-    let baseline_sources = args
-        .shared
-        .baseline_sources
-        .clone()
-        .unwrap_or_else(|| shared::sources::defaults_for_network(&chain));
-    tracing::info!(?baseline_sources, "using baseline sources");
-    let univ2_sources = baseline_sources
-        .iter()
-        .filter_map(|source: &BaselineSource| {
-            UniV2BaselineSourceParameters::from_baseline_source(*source, &chain_id.to_string())
-        })
-        .chain(args.shared.custom_univ2_baseline_sources.iter().copied());
-    let pair_providers: Vec<_> = futures::stream::iter(univ2_sources)
-        .then(|source: UniV2BaselineSourceParameters| {
-            let web3 = &web3;
-            async move { source.into_source(web3).await.unwrap().pair_provider }
-        })
-        .collect()
-        .instrument(info_span!("pair_providers"))
-        .await;
-
-    let base_tokens = Arc::new(BaseTokens::new(
-        *eth.contracts().weth().address(),
-        &args.shared.base_tokens,
-    ));
-    let mut allowed_tokens = args.allowed_tokens.clone();
-    allowed_tokens.extend(base_tokens.tokens().iter());
-    allowed_tokens.push(model::order::BUY_ETH_ADDRESS);
-    let unsupported_tokens = args.unsupported_tokens.clone();
-
-    let finder = token_owner_finder::init(
-        &args.token_owner_finder,
-        web3.clone(),
-        &chain,
-        &http_factory,
-        &pair_providers,
-        vault.as_ref(),
-        uniswapv3_factory.as_ref(),
-        &base_tokens,
-        *eth.contracts().settlement().address(),
-    )
-    .instrument(info_span!("token_owner_finder_init"))
-    .await
-    .expect("failed to initialize token owner finders");
-
-    let trace_call_detector = args.tracing_node_url.as_ref().map(|tracing_node_url| {
-        CachingDetector::new(
-            Box::new(TraceCallDetector::new(
-                shared::ethrpc::web3(
-                    &args.shared.ethrpc,
-                    &http_factory,
-                    tracing_node_url,
-                    "trace",
-                ),
-                *eth.contracts().settlement().address(),
-                finder,
-            )),
-            args.shared.token_quality_cache_expiry,
-            args.shared.token_quality_cache_prefetch_time,
-        )
-    });
-    let bad_token_detector = Arc::new(
-        ListBasedDetector::new(
-            allowed_tokens,
-            unsupported_tokens,
-            trace_call_detector
-                .map(|detector| UnknownTokenStrategy::Forward(detector))
-                .unwrap_or(UnknownTokenStrategy::Allow),
-        )
-        .instrumented(),
-    );
+    let deny_listed_tokens = DenyListedTokens::new(args.unsupported_tokens.clone());
 
     let token_info_fetcher = Arc::new(CachedTokenInfoFetcher::new(Arc::new(TokenInfoFetcher {
         web3: web3.clone(),
     })));
-    let block_retriever = Arc::new(web3.alloy.clone());
+    let block_retriever = Arc::new(BlockRetriever {
+        provider: web3.provider.clone(),
+        block_stream: eth.current_block().clone(),
+    });
 
     let code_fetcher = Arc::new(CachedCodeFetcher::new(Arc::new(web3.clone())));
 
     let mut price_estimator_factory = PriceEstimatorFactory::new(
         &args.price_estimation,
-        &args.shared,
+        &config.native_price_estimation.shared,
         factory::Network {
             web3: web3.clone(),
             simulation_web3,
@@ -375,12 +296,13 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
                 .call()
                 .await
                 .expect("failed to query solver authenticator address"),
-            base_tokens: base_tokens.clone(),
             block_stream: eth.current_block().clone(),
         },
         factory::Components {
-            http_factory: http_factory.clone(),
-            bad_token_detector: bad_token_detector.clone(),
+            http_factory: price_estimation::utils::http_client_factory::HttpClientFactory::new(
+                http_factory.timeout,
+            ),
+            deny_listed_tokens: deny_listed_tokens.clone(),
             tokens: token_info_fetcher.clone(),
             code_fetcher: code_fetcher.clone(),
         },
@@ -389,17 +311,45 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     .await
     .expect("failed to initialize price estimator factory");
 
-    let native_price_estimator = price_estimator_factory
-        .native_price_estimator(
-            args.native_price_estimators.as_slice(),
-            args.native_price_estimation_results_required,
-            eth.contracts().weth().clone(),
-        )
-        .instrument(info_span!("native_price_estimator"))
-        .await
-        .unwrap();
+    let weth = eth.contracts().weth().clone();
     let prices = db_write.fetch_latest_prices().await.unwrap();
-    native_price_estimator.initialize_cache(prices);
+    let shared_cache = price_estimation::native_price_cache::Cache::new(
+        config.native_price_estimation.shared.cache.max_age,
+        prices,
+    );
+    let api_sources = config
+        .native_price_estimation
+        .api_estimators
+        .as_ref()
+        .unwrap_or(&config.native_price_estimation.estimators);
+    let api_native_price_estimator: Arc<dyn NativePriceEstimating> = Arc::new(
+        price_estimator_factory
+            .caching_native_price_estimator(
+                api_sources.as_slice(),
+                config.native_price_estimation.shared.results_required,
+                &weth,
+                shared_cache.clone(),
+            )
+            .instrument(info_span!("api_native_price_estimator"))
+            .await,
+    );
+
+    let competition_native_price_updater = {
+        let caching = price_estimator_factory
+            .caching_native_price_estimator(
+                config.native_price_estimation.estimators.as_slice(),
+                config.native_price_estimation.shared.results_required,
+                &weth,
+                shared_cache.clone(),
+            )
+            .instrument(info_span!("competition_native_price_updater"))
+            .await;
+        price_estimation::native_price_cache::NativePriceUpdater::new(
+            caching,
+            config.native_price_estimation.cache_refresh_interval,
+            config.native_price_estimation.prefetch_time,
+        )
+    };
 
     let price_estimator = price_estimator_factory
         .price_estimator(
@@ -407,16 +357,19 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
                 .order_quoting
                 .price_estimation_drivers
                 .iter()
-                .map(|price_estimator_driver| price_estimator_driver.clone().into())
+                .map(|price_estimator_driver| price_estimation::ExternalSolver {
+                    name: price_estimator_driver.name.clone(),
+                    url: price_estimator_driver.url.clone(),
+                })
                 .collect::<Vec<_>>(),
-            native_price_estimator.clone(),
+            api_native_price_estimator.clone(),
             gas_price_estimator.clone(),
         )
         .unwrap();
 
     let skip_event_sync_start = if args.skip_event_sync {
         Some(
-            block_number_to_block_number_hash(&web3.alloy, BlockNumberOrTag::Latest)
+            block_number_to_block_number_hash(&web3.provider, BlockNumberOrTag::Latest)
                 .await
                 .expect("Failed to fetch latest block"),
         )
@@ -424,15 +377,10 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         None
     };
 
-    let (competition_updates_sender, competition_updates_receiver) =
-        tokio::sync::mpsc::unbounded_channel();
-
     let persistence =
-        infra::persistence::Persistence::new(args.s3.into().unwrap(), Arc::new(db_write.clone()))
+        infra::persistence::Persistence::new(config.s3.map(Into::into), Arc::new(db_write.clone()))
             .instrument(info_span!("persistence_init"))
             .await;
-    let settlement_observer =
-        crate::domain::settlement::Observer::new(eth.clone(), persistence.clone());
     let settlement_contract_start_index = match GPv2Settlement::deployment_block(&chain_id) {
         Some(block) => {
             tracing::debug!(block, "found settlement contract deployment");
@@ -449,12 +397,11 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     };
     let settlement_event_indexer = EventUpdater::new(
         boundary::events::settlement::GPv2SettlementContract::new(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *eth.contracts().settlement().address(),
         ),
         boundary::events::settlement::Indexer::new(
             db_write.clone(),
-            settlement_observer,
             settlement_contract_start_index,
         ),
         block_retriever.clone(),
@@ -465,7 +412,10 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         boundary::web3_client(url, &args.shared.ethrpc)
     });
 
-    let mut cow_amm_registry = cow_amm::Registry::new(archive_node_web3);
+    let mut cow_amm_registry = cow_amm::Registry::new(Arc::new(BlockRetriever {
+        provider: archive_node_web3.provider,
+        block_stream: eth.current_block().clone(),
+    }));
     for config in &args.cow_amm_configs {
         cow_amm_registry
             .add_listener(
@@ -479,7 +429,7 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
 
     let quoter = Arc::new(OrderQuoter::new(
         price_estimator,
-        native_price_estimator.clone(),
+        api_native_price_estimator.clone(),
         gas_price_estimator,
         Arc::new(db_write.clone()),
         order_quoting::Validity {
@@ -506,19 +456,15 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         persistence.clone(),
         infra::banned::Users::new(
             eth.contracts().chainalysis_oracle().clone(),
-            args.banned_users,
-            args.banned_users_max_cache_size.get().to_u64().unwrap(),
+            config.banned_users.addresses,
+            config.banned_users.max_cache_size.get().to_u64().unwrap(),
         ),
         balance_fetcher.clone(),
-        bad_token_detector.clone(),
-        native_price_estimator.clone(),
-        signature_validator.clone(),
+        deny_listed_tokens.clone(),
+        competition_native_price_updater.clone(),
         *eth.contracts().weth().address(),
-        args.limit_order_price_factor
-            .try_into()
-            .expect("limit order price factor can't be converted to BigDecimal"),
         domain::ProtocolFees::new(
-            &args.fee_policies_config,
+            &config.fee_policies,
             args.shared.volume_fee_bucket_overrides.clone(),
             args.shared.enable_sell_equals_buy_volume_fee,
         ),
@@ -526,8 +472,6 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         args.run_loop_native_price_timeout,
         *eth.contracts().settlement().address(),
         args.disable_order_balance_filter,
-        args.disable_1271_order_sig_filter,
-        args.disable_1271_order_balance_filter,
     );
 
     let liveness = Arc::new(Liveness::new(args.max_auction_age));
@@ -536,7 +480,7 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     let (api_shutdown_sender, api_shutdown_receiver) = tokio::sync::oneshot::channel();
     let api_task = tokio::spawn(infra::api::serve(
         args.api_address,
-        native_price_estimator.clone(),
+        api_native_price_estimator,
         args.price_estimation.quote_timeout,
         api_shutdown_receiver,
     ));
@@ -549,8 +493,8 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     );
 
     let order_events_cleaner_config = crate::periodic_db_cleanup::OrderEventsCleanerConfig::new(
-        args.order_events_cleanup_interval,
-        args.order_events_cleanup_threshold,
+        config.order_events_cleanup.cleanup_interval,
+        config.order_events_cleanup.cleanup_threshold,
     );
     let order_events_cleaner = crate::periodic_db_cleanup::OrderEventsCleaner::new(
         order_events_cleaner_config,
@@ -564,22 +508,24 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     );
 
     let market_makable_token_list_configuration = TokenListConfiguration {
-        url: args.trusted_tokens_url,
-        update_interval: args.trusted_tokens_update_interval,
+        url: config.trusted_tokens.url.clone(),
+        update_interval: config.trusted_tokens.update_interval,
         chain_id,
         client: http_factory.create(),
-        hardcoded: args.trusted_tokens.unwrap_or_default(),
+        hardcoded: config.trusted_tokens.tokens.clone(),
     };
     // updated in background task
     let trusted_tokens =
         AutoUpdatingTokenList::from_configuration(market_makable_token_list_configuration).await;
+    let settlement_observer =
+        crate::domain::settlement::Observer::new(eth.clone(), persistence.clone());
 
     let mut maintenance = Maintenance::new(
         settlement_event_indexer,
         db_write.clone(),
-        args.max_maintenance_timeout,
+        settlement_observer,
     );
-    maintenance.with_cow_amms(&cow_amm_registry);
+    maintenance.add_cow_amm_indexer(&cow_amm_registry);
 
     if !args.ethflow_contracts.is_empty() {
         let ethflow_refund_start_block = determine_ethflow_refund_indexing_start(
@@ -635,13 +581,7 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         .await
         .expect("Should be able to initialize event updater. Database read issues?");
 
-        maintenance.spawn_ethflow_indexer(onchain_order_indexer);
-        // refunds are not critical for correctness and can therefore be indexed
-        // sporadically in a background task
-        let service_maintainer = ServiceMaintenance::new(vec![Arc::new(refund_event_handler)]);
-        tokio::task::spawn(
-            service_maintainer.run_maintenance_on_new_block(eth.current_block().clone()),
-        );
+        maintenance.add_ethflow_indexing(onchain_order_indexer, refund_event_handler);
     }
 
     let run_loop_config = run_loop::Config {
@@ -652,22 +592,17 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         max_winners_per_auction: args.max_winners_per_auction,
         max_solutions_per_solver: args.max_solutions_per_solver,
         enable_leader_lock: args.enable_leader_lock,
+        compress_solve_request: args.compress_solve_request,
     };
 
-    let drivers_futures = args
+    let drivers_futures = config
         .drivers
         .into_iter()
         .map(|driver| async move {
-            infra::Driver::try_new(
-                driver.url,
-                driver.name.clone(),
-                driver.fairness_threshold.map(Into::into),
-                driver.submission_account,
-                driver.requested_timeout_on_problems,
-            )
-            .await
-            .map(Arc::new)
-            .expect("failed to load solver configuration")
+            infra::Driver::try_new(driver.url, driver.name.clone(), driver.submission_account)
+                .await
+                .map(Arc::new)
+                .expect("failed to load solver configuration")
         })
         .collect::<Vec<_>>();
 
@@ -677,28 +612,21 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
         .into_iter()
         .collect();
 
-    let solver_participation_guard = SolverParticipationGuard::new(
-        eth.clone(),
-        persistence.clone(),
-        competition_updates_receiver,
-        args.db_based_solver_participation_guard,
-        drivers.iter().cloned(),
-    );
+    let awaiter = maintenance
+        .spawn_maintenance_task(eth.current_block().clone(), args.max_maintenance_timeout);
 
     let run = RunLoop::new(
         run_loop_config,
         eth,
         persistence.clone(),
         drivers,
-        solver_participation_guard,
         solvable_orders_cache,
         trusted_tokens,
         run_loop::Probes {
             liveness: liveness.clone(),
             startup,
         },
-        Arc::new(maintenance),
-        competition_updates_sender,
+        awaiter,
     );
     run.run_forever(shutdown_controller).await;
 
@@ -706,7 +634,7 @@ pub async fn run(args: Arguments, shutdown_controller: ShutdownController) {
     api_task.await.ok();
 }
 
-async fn shadow_mode(args: Arguments) -> ! {
+async fn shadow_mode(args: CliArguments, config: Configuration) -> ! {
     let http_factory = HttpClientFactory::new(&args.http_client);
 
     let orderbook = infra::shadow::Orderbook::new(
@@ -714,14 +642,13 @@ async fn shadow_mode(args: Arguments) -> ! {
         args.shadow.expect("missing shadow mode configuration"),
     );
 
-    let drivers_futures = args
+    let drivers_futures = config
         .drivers
         .into_iter()
         .map(|driver| async move {
             infra::Driver::try_new(
                 driver.url,
                 driver.name.clone(),
-                driver.fairness_threshold.map(Into::into),
                 // HACK: the auction logic expects all drivers
                 // to use a different submission address. But
                 // in the shadow environment all drivers use
@@ -731,7 +658,6 @@ async fn shadow_mode(args: Arguments) -> ! {
                 // this address for anything important so we
                 // can simply generate random addresses here.
                 Account::Address(Address::random()),
-                driver.requested_timeout_on_problems,
             )
             .await
             .map(Arc::new)
@@ -744,19 +670,14 @@ async fn shadow_mode(args: Arguments) -> ! {
         .into_iter()
         .collect();
 
-    let web3 = shared::ethrpc::web3(
-        &args.shared.ethrpc,
-        &http_factory,
-        &args.shared.node_url,
-        "base",
-    );
-    let weth = WETH9::Instance::deployed(&web3.alloy)
+    let web3 = shared::web3::web3(&args.shared.ethrpc, &args.shared.node_url, "base");
+    let weth = WETH9::Instance::deployed(&web3.provider)
         .await
         .expect("couldn't find deployed WETH contract");
 
     let trusted_tokens = {
         let chain_id = web3
-            .alloy
+            .provider
             .get_chain_id()
             .await
             .expect("Could not get chainId");
@@ -768,11 +689,11 @@ async fn shadow_mode(args: Arguments) -> ! {
         }
 
         AutoUpdatingTokenList::from_configuration(TokenListConfiguration {
-            url: args.trusted_tokens_url,
-            update_interval: args.trusted_tokens_update_interval,
+            url: config.trusted_tokens.url,
+            update_interval: config.trusted_tokens.update_interval,
             chain_id,
             client: http_factory.create(),
-            hardcoded: args.trusted_tokens.unwrap_or_default(),
+            hardcoded: config.trusted_tokens.tokens,
         })
         .await
     };
@@ -788,7 +709,7 @@ async fn shadow_mode(args: Arguments) -> ! {
     let current_block = args
         .shared
         .current_block
-        .stream(args.shared.node_url, web3.alloy.clone())
+        .stream(args.shared.node_url, web3.provider.clone())
         .await
         .expect("couldn't initialize current block stream");
 
@@ -797,6 +718,7 @@ async fn shadow_mode(args: Arguments) -> ! {
         drivers,
         trusted_tokens,
         args.solve_deadline,
+        args.compress_solve_request,
         liveness.clone(),
         current_block,
         args.max_winners_per_auction,

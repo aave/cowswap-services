@@ -7,6 +7,8 @@ use {
             types::{Transaction, TransactionReceipt},
         },
     },
+    autopilot::config::Configuration,
+    configs::test_util::TestDefault,
     e2e::setup::*,
     ethrpc::alloy::{CallBuilderExt, EvmProviderExt},
     futures::StreamExt,
@@ -16,7 +18,8 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::{nonzero::NonZeroU256, testing::ApproxEq, units::EthUnit},
-    shared::ethrpc::Web3,
+    orderbook::config::order_validation::OrderValidationConfig,
+    shared::web3::Web3,
     std::time::Duration,
 };
 
@@ -71,7 +74,7 @@ async fn test_cancel_on_expiry(web3: Web3) {
     services.start_protocol(solver.clone()).await;
 
     // Disable auto-mine so we don't accidentally mine a settlement
-    web3.alloy
+    web3.provider
         .evm_set_automine(false)
         .await
         .expect("Must be able to disable automine");
@@ -98,7 +101,7 @@ async fn test_cancel_on_expiry(web3: Web3) {
 
     // Start tracking confirmed blocks so we can find the transaction later
     let block_stream = web3
-        .alloy
+        .provider
         .watch_blocks()
         .await
         .expect("must be able to create blocks filter")
@@ -112,11 +115,11 @@ async fn test_cancel_on_expiry(web3: Web3) {
     .unwrap();
 
     // Restart mining, but with blocks that are too small to fit the settlement
-    web3.alloy
+    web3.provider
         .evm_set_block_gas_limit(100_000)
         .await
         .expect("Must be able to set block gas limit");
-    web3.alloy
+    web3.provider
         .evm_set_interval_mining(1)
         .await
         .expect("Must be able to set mining interval");
@@ -158,16 +161,21 @@ async fn test_submit_same_sell_and_buy_token_order_without_quote(web3: Web3) {
     let services = Services::new(&onchain).await;
     services
         .start_protocol_with_args(
-            ExtraServiceArgs {
-                api: vec!["--same-tokens-policy=allow-sell".to_string()],
-                ..Default::default()
+            Default::default(),
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration {
+                order_validation: OrderValidationConfig {
+                    same_tokens_policy: shared::order_validation::SameTokensPolicy::AllowSell,
+                    ..Default::default()
+                },
+                ..orderbook::config::Configuration::test_default()
             },
             solver.clone(),
         )
         .await;
 
     // Disable auto-mine so we don't accidentally mine a settlement
-    web3.alloy
+    web3.provider
         .evm_set_automine(false)
         .await
         .expect("Must be able to disable automine");
@@ -196,7 +204,7 @@ async fn test_submit_same_sell_and_buy_token_order_without_quote(web3: Web3) {
     services.create_order(&order).await.unwrap();
     // Start tracking confirmed blocks so we can find the transaction later
     let block_stream = web3
-        .alloy
+        .provider
         .watch_blocks()
         .await
         .expect("must be able to create blocks filter")
@@ -213,7 +221,7 @@ async fn test_submit_same_sell_and_buy_token_order_without_quote(web3: Web3) {
     .unwrap();
 
     // Continue mining to confirm the settlement
-    web3.alloy
+    web3.provider
         .evm_set_automine(true)
         .await
         .expect("Must be able to enable automine");
@@ -269,16 +277,21 @@ async fn test_execute_same_sell_and_buy_token(web3: Web3) {
     let services = Services::new(&onchain).await;
     services
         .start_protocol_with_args(
-            ExtraServiceArgs {
-                api: vec!["--same-tokens-policy=allow-sell".to_string()],
-                ..Default::default()
+            Default::default(),
+            Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration {
+                order_validation: OrderValidationConfig {
+                    same_tokens_policy: shared::order_validation::SameTokensPolicy::AllowSell,
+                    ..Default::default()
+                },
+                ..orderbook::config::Configuration::test_default()
             },
             solver.clone(),
         )
         .await;
 
     // Disable auto-mine so we don't accidentally mine a settlement
-    web3.alloy
+    web3.provider
         .evm_set_automine(false)
         .await
         .expect("Must be able to disable automine");
@@ -358,7 +371,7 @@ async fn test_execute_same_sell_and_buy_token(web3: Web3) {
 
     // Start tracking confirmed blocks so we can find the transaction later
     let block_stream = web3
-        .alloy
+        .provider
         .watch_blocks()
         .await
         .expect("must be able to create blocks filter")
@@ -375,7 +388,7 @@ async fn test_execute_same_sell_and_buy_token(web3: Web3) {
     .unwrap();
 
     // Continue mining to confirm the settlement
-    web3.alloy
+    web3.provider
         .evm_set_automine(true)
         .await
         .expect("Must be able to enable automine");
@@ -411,7 +424,7 @@ async fn test_execute_same_sell_and_buy_token(web3: Web3) {
 
 async fn get_pending_tx(account: Address, web3: &Web3) -> Option<Transaction> {
     let txpool = web3
-        .alloy
+        .provider
         .txpool_content()
         .await
         .expect("must be able to inspect mempool");
@@ -428,7 +441,7 @@ async fn get_confirmed_transaction(
         let block_hashes = block_hash_stream.next().await.unwrap();
         for block_hash in block_hashes {
             let transaction_senders = web3
-                .alloy
+                .provider
                 .get_block_receipts(block_hash.into())
                 .await
                 .unwrap()

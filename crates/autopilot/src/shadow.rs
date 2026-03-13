@@ -39,6 +39,7 @@ pub struct RunLoop {
     auction: domain::auction::Id,
     block: u64,
     solve_deadline: Duration,
+    compress_solve_request: bool,
     liveness: Arc<Liveness>,
     current_block: CurrentBlockWatcher,
     winner_selection: winner_selection::Arbitrator,
@@ -51,6 +52,7 @@ impl RunLoop {
         drivers: Vec<Arc<infra::Driver>>,
         trusted_tokens: AutoUpdatingTokenList,
         solve_deadline: Duration,
+        compress_solve_request: bool,
         liveness: Arc<Liveness>,
         current_block: CurrentBlockWatcher,
         max_winners_per_auction: NonZeroUsize,
@@ -67,6 +69,7 @@ impl RunLoop {
             auction: 0,
             block: 0,
             solve_deadline,
+            compress_solve_request,
             liveness,
             current_block,
         }
@@ -77,12 +80,12 @@ impl RunLoop {
         loop {
             // We use this as a synchronization mechanism to sync the run loop starts with
             // the next mined block
-            let _ = ethrpc::block_stream::next_block(&self.current_block).await;
+            let start_block = ethrpc::block_stream::next_block(&self.current_block).await;
             let Some(auction) = self.next_auction().await else {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
-            observe::log_auction_delta(&previous, &auction);
+            observe::log_auction_delta(&previous, &auction, &start_block);
             self.liveness.auction();
 
             self.single_run(&auction)
@@ -179,7 +182,13 @@ impl RunLoop {
     /// Runs the solver competition, making all configured drivers participate.
     #[instrument(skip_all)]
     async fn competition(&self, auction: &domain::Auction) -> Vec<Bid<Unscored>> {
-        let request = solve::Request::new(auction, &self.trusted_tokens.all(), self.solve_deadline);
+        let request = solve::Request::new(
+            auction,
+            &self.trusted_tokens.all(),
+            self.solve_deadline,
+            self.compress_solve_request,
+        )
+        .await;
 
         futures::future::join_all(
             self.drivers
@@ -204,14 +213,14 @@ impl RunLoop {
             Ok(response) => {
                 Metrics::get()
                     .results
-                    .with_label_values(&[&driver.name, "ok"])
+                    .with_label_values(&[driver.name.as_str(), "ok"])
                     .inc();
                 response.into_domain()
             }
             Err(err) => {
                 Metrics::get()
                     .results
-                    .with_label_values(&[&driver.name, "error"])
+                    .with_label_values(&[driver.name.as_str(), "error"])
                     .inc();
                 tracing::debug!(driver = driver.name, %err, "failed to fetch solutions");
                 return vec![];

@@ -1,7 +1,7 @@
 use {
     super::Postgres,
     crate::dto::TokenMetadata,
-    alloy::primitives::{Address, B256},
+    alloy::primitives::{Address, B256, map::HashSet},
     anyhow::{Context as _, Result},
     app_data::AppDataHash,
     async_trait::async_trait,
@@ -12,7 +12,7 @@ use {
         order_events::{OrderEvent, OrderEventLabel, insert_order_event},
         orders::{self, FullOrder, OrderKind as DbOrderKind},
     },
-    futures::{FutureExt, StreamExt, stream::TryStreamExt},
+    futures::{FutureExt, StreamExt, stream::TryStreamExt, try_join},
     model::{
         order::{
             EthflowData,
@@ -75,6 +75,7 @@ pub trait OrderStoring: Send + Sync {
     ) -> Result<Vec<Order>>;
     async fn latest_order_event(&self, order_uid: &OrderUid) -> Result<Option<OrderEvent>>;
     async fn single_order(&self, uid: &OrderUid) -> Result<Option<Order>>;
+    async fn many_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>>;
 }
 
 #[derive(Debug)]
@@ -311,6 +312,50 @@ impl OrderStoring for Postgres {
             }
         }
         .transpose()
+    }
+
+    async fn many_orders(&self, uids: &[OrderUid]) -> Result<Vec<(OrderUid, Result<Order>)>> {
+        let _timer = super::Metrics::get()
+            .database_queries
+            .with_label_values(&["many_orders"])
+            .start_timer();
+        // Deduplicate order UIDs
+        let uids = uids
+            .iter()
+            .map(|uid| ByteArray(uid.0))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut ex_orders = self.pool.acquire().await?;
+        let mut ex_jit_orders = self.pool.acquire().await?;
+
+        let (orders, jit_orders) = try_join!(
+            database::orders::many_full_orders_with_quotes(&mut ex_orders, &uids),
+            // JIT orders are fetched without quotes as they are created by solvers at settlement
+            // time
+            database::jit_orders::get_many_by_uid(&mut ex_jit_orders, &uids)
+        )?;
+        Ok(orders
+            .into_iter()
+            .map(|order| {
+                let (order, quote) = order.into_order_and_quote();
+                let uid = OrderUid(order.uid.0);
+                let result =
+                    full_order_with_quote_into_model_order(order, quote.as_ref()).map_err(|err| {
+                        tracing::warn!(?err, "Error converting into model order");
+                        err.context("Error converting into model order")
+                    });
+                (uid, result)
+            })
+            .chain(jit_orders.into_iter().map(|order| {
+                let uid = OrderUid(order.uid.0);
+                let result = full_order_into_model_order(order).map_err(|err| {
+                    tracing::warn!(?err, "Error converting Jit order into model order");
+                    err.context("Error converting Jit order into model order")
+                });
+                (uid, result)
+            }))
+            .collect())
     }
 
     async fn orders_for_tx(&self, tx_hash: &B256) -> Result<Vec<Order>> {
@@ -867,7 +912,7 @@ mod tests {
     async fn postgres_replace_order() {
         let owner = Address::repeat_byte(0x77);
 
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         let old_order = Order {
@@ -933,7 +978,7 @@ mod tests {
     async fn postgres_replace_order_no_cancellation_on_error() {
         let owner = Address::repeat_byte(0x77);
 
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         let old_order = Order {
@@ -977,7 +1022,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn postgres_presignature_status() {
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
         let uid = OrderUid([0u8; 56]);
         let order = Order {
@@ -1050,7 +1095,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn postgres_cancel_orders() {
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         // Define some helper closures to make the test easier to read.
@@ -1099,7 +1144,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn postgres_insert_orders_with_interactions() {
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         let interaction = |byte: u8| InteractionData {
@@ -1156,7 +1201,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn postgres_insert_orders_with_interactions_and_verified() {
-        let db = Postgres::try_new("postgresql://").unwrap();
+        let db = Postgres::try_new("postgresql://", Default::default()).unwrap();
         database::clear_DANGER(&db.pool).await.unwrap();
 
         let quote = Quote {

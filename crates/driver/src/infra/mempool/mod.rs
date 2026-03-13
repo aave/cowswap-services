@@ -1,17 +1,19 @@
 use {
     crate::{
-        boundary::unbuffered_web3_client,
+        boundary::{Web3, unbuffered_web3},
         domain::{eth, mempools},
         infra::{self, solver::Account},
     },
     alloy::{
         consensus::Transaction,
-        eips::BlockNumberOrTag,
+        eips::{BlockNumberOrTag, eip1559::Eip1559Estimation},
+        primitives::Address,
         providers::{Provider, ext::TxPoolApi},
         rpc::types::TransactionRequest,
     },
     anyhow::Context,
-    ethrpc::Web3,
+    dashmap::DashMap,
+    std::sync::Arc,
     url::Url,
 };
 
@@ -64,6 +66,13 @@ pub enum RevertProtection {
 pub struct Mempool {
     transport: Web3,
     config: Config,
+    last_submissions: Arc<DashMap<Address, Submission>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Submission {
+    pub nonce: u64,
+    pub gas_price: Eip1559Estimation,
 }
 
 impl std::fmt::Display for Mempool {
@@ -74,19 +83,23 @@ impl std::fmt::Display for Mempool {
 
 impl Mempool {
     pub fn new(config: Config, solver_accounts: Vec<Account>) -> Self {
-        let transport = unbuffered_web3_client(&config.url);
+        let transport = unbuffered_web3(&config.url);
         // Register the solver accounts into the wallet to submit txs on their behalf
         for account in solver_accounts {
             transport.wallet.register_signer(account);
         }
-        Self { transport, config }
+        Self {
+            transport,
+            config,
+            last_submissions: Default::default(),
+        }
     }
 
     /// Fetches the transaction count (nonce) for the given address at the
     /// specified block number. If no block number is provided in the config,
     /// uses the alloy's default behavior.
     pub async fn get_nonce(&self, address: eth::Address) -> Result<u64, mempools::Error> {
-        let call = self.transport.alloy.get_transaction_count(address);
+        let call = self.transport.provider.get_transaction_count(address);
         match self.config.nonce_block_number {
             Some(BlockNumberOrTag::Latest) => call.latest(),
             Some(BlockNumberOrTag::Earliest) => call.earliest(),
@@ -103,43 +116,34 @@ impl Mempool {
     }
 
     /// Submits a transaction to the mempool. Returns optimistically as soon as
-    /// the transaction is pending.
+    /// the transaction is pending. `signer` is the address that signs and pays
+    /// for gas (may differ from the solver address in EIP-7702 mode).
     pub async fn submit(
         &self,
         tx: eth::Tx,
-        gas_price: eth::GasPrice,
+        gas_price: Eip1559Estimation,
         gas_limit: eth::Gas,
-        solver: &infra::Solver,
+        signer: eth::Address,
         nonce: u64,
     ) -> Result<eth::TxId, mempools::Error> {
-        let max_fee_per_gas = gas_price
-            .max()
-            .0
-            .0
-            .try_into()
-            .map_err(anyhow::Error::from)?;
-        let max_priority_fee_per_gas = gas_price
-            .tip()
-            .0
-            .0
-            .try_into()
-            .map_err(anyhow::Error::from)?;
+        let max_fee_per_gas = gas_price.max_fee_per_gas;
+        let max_priority_fee_per_gas = gas_price.max_priority_fee_per_gas;
         let gas_limit = gas_limit.0.try_into().map_err(anyhow::Error::from)?;
 
         let tx_request = TransactionRequest::default()
-            .from(solver.address())
+            .from(signer)
             .to(tx.to)
             .nonce(nonce)
             .max_fee_per_gas(max_fee_per_gas)
             .max_priority_fee_per_gas(max_priority_fee_per_gas)
             .gas_limit(gas_limit)
-            .input(tx.input.0.into())
+            .input(tx.input.into())
             .value(tx.value.0)
             .access_list(tx.access_list.into());
 
         let submission = self
             .transport
-            .alloy
+            .provider
             .send_transaction(tx_request)
             .await
             .map_err(anyhow::Error::from);
@@ -150,24 +154,24 @@ impl Mempool {
                     ?nonce,
                     ?gas_price,
                     ?gas_limit,
-                    solver = ?solver.address(),
+                    ?signer,
                     "successfully submitted tx to mempool"
                 );
+                self.last_submissions
+                    .insert(signer, Submission { nonce, gas_price });
                 Ok(eth::TxId(*tx.tx_hash()))
             }
             Err(err) => {
                 // log pending tx in case we failed to replace a pending tx
-                let pending_tx = self
-                    .find_pending_tx_in_mempool(solver.address(), nonce)
-                    .await;
+                let last_submission = self.last_submission(signer);
 
                 tracing::debug!(
                     ?err,
                     new_gas_price = ?gas_price,
                     ?nonce,
-                    ?pending_tx,
+                    ?last_submission,
                     ?gas_limit,
-                    solver = ?solver.address(),
+                    ?signer,
                     "failed to submit tx to mempool"
                 );
                 Err(mempools::Error::Other(err))
@@ -184,7 +188,7 @@ impl Mempool {
     ) -> anyhow::Result<Option<alloy::rpc::types::Transaction>> {
         let tx_pool_content = self
             .transport
-            .alloy
+            .provider
             .txpool_content_from(signer)
             .await
             .context("failed to query pending transactions")?;
@@ -197,6 +201,13 @@ impl Mempool {
             .find(|(_signer, tx)| tx.nonce() == nonce)
             .map(|(_, tx)| tx);
         Ok(pending_tx)
+    }
+
+    /// Looks up the last tx that was submitted for that signer.
+    pub fn last_submission(&self, signer: eth::Address) -> Option<Submission> {
+        self.last_submissions
+            .get(&signer)
+            .map(|entry| entry.value().clone())
     }
 
     pub fn config(&self) -> &Config {

@@ -22,16 +22,13 @@ use {
     },
     error::Error,
     futures::Future,
-    observe::distributed_tracing::tracing_axum::{make_span, record_trace_id},
-    shared::account_balances,
+    observe::tracing::distributed::axum::{make_span, record_trace_id},
     std::{net::SocketAddr, sync::Arc},
     tokio::sync::oneshot,
 };
 
 mod error;
 pub mod routes;
-
-const REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
 pub struct Api {
     pub solvers: Vec<Solver>,
@@ -53,11 +50,9 @@ impl Api {
         shutdown: impl Future<Output = ()> + Send + 'static,
         order_priority_strategies: Vec<OrderPriorityStrategy>,
         app_data_retriever: Option<AppDataRetriever>,
-    ) -> Result<(), hyper::Error> {
+    ) -> Result<(), std::io::Error> {
         // Add middleware.
-        let mut app = axum::Router::new().layer(tower::ServiceBuilder::new().layer(
-            tower_http::limit::RequestBodyLimitLayer::new(REQUEST_BODY_LIMIT),
-        ));
+        let mut app = axum::Router::new();
 
         let balance_fetcher = account_balances::cached(
             self.eth.web3(),
@@ -96,7 +91,6 @@ impl Api {
             let router = routes::solve(router);
             let router = routes::reveal(router);
             let router = routes::settle(router);
-            let router = routes::notify(router);
 
             let bad_order_config = solver.bad_order_detection();
             let mut bad_tokens =
@@ -140,8 +134,10 @@ impl Api {
         }
 
         app = app
-            // axum's default body limit needs to be disabled to not have the default limit on top of our custom limit
+            // axum's default body limit is 2MB too low for solvers, 20MB is still too low
+            // so instead of constantly guessing and updating, we disable the limit altogether
             .layer(axum::extract::DefaultBodyLimit::disable())
+            .layer(tower_http::decompression::RequestDecompressionLayer::new())
             .layer(
                 tower::ServiceBuilder::new()
                     .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(make_span))
@@ -149,12 +145,15 @@ impl Api {
             );
 
         // Start the server.
-        let server = axum::Server::bind(&self.addr).serve(app.into_make_service());
-        tracing::info!(port = server.local_addr().port(), "serving driver");
+        let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        let local_addr = listener.local_addr()?;
+        tracing::info!(port = local_addr.port(), "serving driver");
         if let Some(addr_sender) = self.addr_sender {
-            addr_sender.send(server.local_addr()).unwrap();
+            addr_sender.send(local_addr).unwrap();
         }
-        server.with_graceful_shutdown(shutdown).await
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
     }
 
     fn build_order_sorting_strategies(

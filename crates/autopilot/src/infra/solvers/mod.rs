@@ -1,17 +1,17 @@
 use {
     self::dto::{reveal, settle, solve},
-    crate::{arguments::Account, domain::eth, infra::solvers::dto::notify, util},
+    crate::{config::solver::Account, domain::eth, util},
     alloy::signers::{Signer, aws::AwsSigner},
     anyhow::{Context, Result, anyhow},
-    chrono::{DateTime, Utc},
-    observe::tracing::tracing_headers,
-    reqwest::{Client, StatusCode},
-    std::{sync::Arc, time::Duration},
+    observe::tracing::{distributed::headers::tracing_headers, lazy::Lazy},
+    reqwest::{Client, RequestBuilder, StatusCode},
+    std::{borrow::Cow, time::Duration},
     thiserror::Error,
     tracing::instrument,
     url::Url,
 };
 
+mod byte_stream;
 pub mod dto;
 
 const RESPONSE_SIZE_LIMIT: usize = 10_000_000;
@@ -20,12 +20,7 @@ const RESPONSE_TIME_LIMIT: Duration = Duration::from_secs(60);
 pub struct Driver {
     pub name: String,
     pub url: Url,
-    // An optional threshold used to check "fairness" of provided solutions. If specified, a
-    // winning solution should be discarded if it contains at least one order, which
-    // another driver solved with surplus exceeding this driver's surplus by `threshold`
-    pub fairness_threshold: Option<eth::Ether>,
     pub submission_address: eth::Address,
-    pub requested_timeout_on_problems: bool,
     client: Client,
 }
 
@@ -42,9 +37,7 @@ impl Driver {
     pub async fn try_new(
         url: Url,
         name: String,
-        fairness_threshold: Option<eth::Ether>,
         submission_account: Account,
-        requested_timeout_on_problems: bool,
     ) -> Result<Self, Error> {
         let submission_address = match submission_account {
             Account::Kms(key_id) => {
@@ -60,25 +53,17 @@ impl Driver {
             }
             Account::Address(address) => address,
         };
-        tracing::info!(
-            ?name,
-            ?url,
-            ?fairness_threshold,
-            ?submission_address,
-            "Creating solver"
-        );
+        tracing::info!(?name, ?url, ?submission_address, "Creating solver");
 
         Ok(Self {
             name,
             url,
-            fairness_threshold,
             client: Client::builder()
                 .timeout(RESPONSE_TIME_LIMIT)
                 .tcp_keepalive(Duration::from_secs(60))
                 .build()
                 .map_err(Error::FailedToBuildClient)?,
             submission_address,
-            requested_timeout_on_problems,
         })
     }
 
@@ -123,37 +108,27 @@ impl Driver {
         Ok(())
     }
 
-    pub async fn notify(&self, request: notify::Request) -> Result<()> {
-        self.request_response("notify", request).await
-    }
-
     async fn request_response<Response, Request>(
         &self,
         path: &str,
-        request: Request,
+        payload: Request,
     ) -> Result<Response>
     where
         Response: serde::de::DeserializeOwned,
-        Request: serde::Serialize + Send + Sync + 'static,
+        Request: InjectIntoHttpRequest,
     {
         let url = util::join(&self.url, path);
+
         tracing::trace!(
-            path=&url.path(),
-            body=%serde_json::to_string_pretty(&request).unwrap(),
+            path = &url.path(),
+            body = %Lazy(|| payload.body_to_string()),
             "solver request",
         );
-        let mut request = {
-            let builder = self.client.post(url.clone()).headers(tracing_headers());
-            // If the payload is very big then serializing it will block the
-            // executor a long time (mostly relevant for solve requests).
-            // That's why we always do it on a thread specifically for
-            // running blocking tasks.
-            tokio::task::spawn_blocking(move || builder.json(&request))
-                .await
-                .context("failed to build request")?
-        };
 
-        if let Some(request_id) = observe::distributed_tracing::request_id::from_current_span() {
+        let request = self.client.post(url.clone()).headers(tracing_headers());
+        let mut request = payload.inject(request);
+
+        if let Some(request_id) = observe::tracing::distributed::request_id::from_current_span() {
             request = request.header("X-REQUEST-ID", request_id);
         }
 
@@ -190,17 +165,21 @@ pub async fn response_body_with_size_limit(
     Ok(bytes)
 }
 
-/// Notifies the non-settling driver in a fire-and-forget manner.
-pub fn notify_banned_solver(
-    non_settling_driver: Arc<Driver>,
-    reason: notify::BanReason,
-    banned_until: DateTime<Utc>,
-) {
-    let request = notify::Request::Banned {
-        reason,
-        until: banned_until,
-    };
-    tokio::spawn(async move {
-        let _ = non_settling_driver.notify(request).await;
-    });
+trait InjectIntoHttpRequest {
+    fn inject(&self, request: RequestBuilder) -> RequestBuilder;
+    fn body_to_string(&self) -> Cow<'_, str>;
+}
+
+impl<T> InjectIntoHttpRequest for T
+where
+    T: serde::ser::Serialize + Sized,
+{
+    fn inject(&self, request: RequestBuilder) -> RequestBuilder {
+        request.json(&self)
+    }
+
+    fn body_to_string(&self) -> Cow<'_, str> {
+        let serialized = serde_json::to_string(&self).expect("type should be JSON serializable");
+        Cow::Owned(serialized)
+    }
 }

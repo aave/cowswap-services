@@ -2,17 +2,24 @@ use {
     crate::{
         boundary,
         domain::{self, eth},
-        infra::persistence::dto::{self, order::Order},
+        infra::{
+            persistence::dto::{self, order::Order},
+            solvers::{InjectIntoHttpRequest, byte_stream::ByteStream},
+        },
     },
     alloy::primitives::{Address, U256},
+    brotli::enc::writer::CompressorWriter,
+    bytes::Bytes,
     chrono::{DateTime, Utc},
     itertools::Itertools,
     number::serialization::HexOrDecimalU256,
+    reqwest::{RequestBuilder, header::HeaderValue},
     serde::{Deserialize, Serialize},
     serde_with::{DisplayFromStr, serde_as},
     std::{
+        borrow::Cow,
         collections::{HashMap, HashSet},
-        sync::Arc,
+        io::Write,
         time::Duration,
     },
 };
@@ -21,20 +28,19 @@ use {
 /// request. The purpose of this is to make it ergonomic
 /// to serialize a request once and reuse the resulting
 /// string in multiple HTTP requests.
-#[derive(Clone, Debug, Serialize, derive_more::Display)]
-pub struct Request(Arc<serde_json::value::RawValue>);
-
-impl Request {
-    pub fn as_str(&self) -> &str {
-        self.0.get()
-    }
+#[derive(Clone, Debug)]
+pub struct Request {
+    auction_id: i64,
+    body: bytes::Bytes,
+    content_encoding: Option<HeaderValue>,
 }
 
 impl Request {
-    pub fn new(
+    pub async fn new(
         auction: &domain::Auction,
         trusted_tokens: &HashSet<Address>,
         time_limit: Duration,
+        compress: bool,
     ) -> Self {
         let _timer =
             observe::metrics::metrics().on_auction_overhead_start("autopilot", "serialize_request");
@@ -64,9 +70,85 @@ impl Request {
             deadline: Utc::now() + chrono::Duration::from_std(time_limit).unwrap(),
             surplus_capturing_jit_order_owners: auction.surplus_capturing_jit_order_owners.to_vec(),
         };
-        Self(Arc::from(serde_json::value::to_raw_value(&helper).expect(
-            "only fails with non-string keys which we do not have",
-        )))
+        let auction_id = auction.id;
+
+        let (body, content_encoding) = tokio::task::spawn_blocking(move || {
+            let serialized = serde_json::to_vec(&helper).expect("type should be JSON serializable");
+
+            if !compress {
+                return (Bytes::from(serialized), None);
+            }
+
+            // quality 1: fastest brotli level. Already beats gzip-3 on both
+            // ratio and speed for our JSON payloads.
+            //
+            // lgwin 22: LZ77 window = 2^22 - 16 ≈ 4 MB. How far back the
+            // compressor looks for repeated patterns. The decompressor must
+            // allocate up to this much memory. Aligns with our current auction size
+            // (~3-4mb).
+            //
+            // 4096: internal I/O buffer for flushing to the output Vec.
+            // Doesn't affect compression ratio. Tested 512 B to 256 KB with
+            // no meaningful difference; 4 KB is a standard default.
+            let mut encoder = CompressorWriter::new(Vec::new(), 4096, 1, 22);
+            match encoder.write_all(&serialized).and_then(|_| encoder.flush()) {
+                Ok(()) => (
+                    Bytes::from(encoder.into_inner()),
+                    Some(HeaderValue::from_static("br")),
+                ),
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        "brotli compression failed, falling back to uncompressed"
+                    );
+                    (Bytes::from(serialized), None)
+                }
+            }
+        })
+        .await
+        .expect("inner task should not panic as serialization should work for the given type");
+
+        Self {
+            body,
+            auction_id,
+            content_encoding,
+        }
+    }
+
+    pub fn body_size(&self) -> usize {
+        self.body.len()
+    }
+}
+
+impl InjectIntoHttpRequest for Request {
+    fn inject(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = request
+            .body(reqwest::Body::wrap_stream(ByteStream::new(
+                self.body.clone(),
+            )))
+            // announce which auction this request is for in the
+            // headers to help the driver detect duplicated
+            // `/solve` requests before streaming the body
+            .header("X-Auction-Id", self.auction_id)
+            // manually set the content type header for JSON since
+            // we can't use `request.json(self)`
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+        if let Some(encoding) = &self.content_encoding {
+            request.header(reqwest::header::CONTENT_ENCODING, encoding)
+        } else {
+            request
+        }
+    }
+
+    fn body_to_string(&self) -> Cow<'_, str> {
+        if self.content_encoding.is_some() {
+            return Cow::Borrowed("<compressed>");
+        }
+        let string = str::from_utf8(self.body.as_ref()).unwrap();
+        Cow::Borrowed(string)
     }
 }
 
@@ -197,4 +279,78 @@ pub struct Solution {
 #[serde(rename_all = "camelCase")]
 pub struct Response {
     pub solutions: Vec<Solution>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_json() -> Vec<u8> {
+        let json_value = serde_json::json!({
+            "id": "1",
+            "tokens": (0..100).map(|i| {
+                serde_json::json!({
+                    "address": format!("0x{:040x}", i),
+                    "price": format!("{}", i * 1000),
+                    "trusted": i % 2 == 0
+                })
+            }).collect::<Vec<_>>(),
+            "orders": [],
+            "deadline": "2025-01-01T00:00:00Z",
+            "surplusCapturingJitOrderOwners": []
+        });
+        serde_json::to_vec(&json_value).unwrap()
+    }
+
+    fn uncompressed_request(json: Vec<u8>) -> Request {
+        Request {
+            auction_id: 1,
+            body: Bytes::from(json),
+            content_encoding: None,
+        }
+    }
+
+    fn compressed_request(json: &[u8]) -> Request {
+        use brotli::enc::writer::CompressorWriter;
+
+        let mut encoder = CompressorWriter::new(Vec::new(), 4096, 1, 22);
+        encoder.write_all(json).unwrap();
+        encoder.flush().unwrap();
+        let compressed = encoder.into_inner();
+        Request {
+            auction_id: 1,
+            body: Bytes::from(compressed),
+            content_encoding: Some(HeaderValue::from_static("br")),
+        }
+    }
+
+    #[test]
+    fn compressed_request_round_trips() {
+        let json = make_test_json();
+
+        let request = compressed_request(&json);
+        assert_eq!(
+            request.content_encoding.as_ref().map(|v| v.as_bytes()),
+            Some("br".as_bytes())
+        );
+        assert!(
+            request.body.len() < json.len(),
+            "compressed body {} should be smaller than original {}",
+            request.body.len(),
+            json.len(),
+        );
+
+        let mut decompressed = Vec::new();
+        brotli::BrotliDecompress(&mut request.body.as_ref(), &mut decompressed).unwrap();
+        assert_eq!(decompressed, json);
+    }
+
+    #[test]
+    fn uncompressed_request_preserves_json() {
+        let json = make_test_json();
+        let request = uncompressed_request(json.clone());
+
+        assert_eq!(request.content_encoding, None);
+        assert_eq!(request.body.as_ref(), json.as_slice());
+    }
 }

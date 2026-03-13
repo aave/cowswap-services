@@ -1,6 +1,5 @@
 use {
-    crate::util::Bytes,
-    alloy::rpc::types::TransactionRequest,
+    alloy::{primitives::Bytes, rpc::types::TransactionRequest},
     derive_more::{From, Into},
     number::u256_ext::U256Ext,
     solvers_dto::auction::FlashloanHint,
@@ -327,7 +326,7 @@ pub struct BlockNo(pub u64);
 pub struct Interaction {
     pub target: Address,
     pub value: Ether,
-    pub call_data: Bytes<Vec<u8>>,
+    pub call_data: Bytes,
 }
 
 impl From<Interaction> for model::interaction::InteractionData {
@@ -335,7 +334,7 @@ impl From<Interaction> for model::interaction::InteractionData {
         Self {
             target: interaction.target,
             value: interaction.value.0,
-            call_data: interaction.call_data.0,
+            call_data: interaction.call_data.to_vec(),
         }
     }
 }
@@ -364,25 +363,14 @@ pub enum TxStatus {
 }
 
 /// An onchain transaction.
-#[derive(Clone)]
+#[derive(derive_more::Debug, Clone)]
 pub struct Tx {
     pub from: Address,
     pub to: Address,
     pub value: Ether,
-    pub input: Bytes<Vec<u8>>,
+    pub input: Bytes,
+    #[debug(ignore)]
     pub access_list: AccessList,
-}
-
-impl std::fmt::Debug for Tx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tx")
-            .field("from", &self.from)
-            .field("to", &self.to)
-            .field("value", &self.value)
-            .field("input", &self.input)
-            .field("access_list", &self.access_list)
-            .finish()
-    }
 }
 
 impl From<Tx> for TransactionRequest {
@@ -391,7 +379,7 @@ impl From<Tx> for TransactionRequest {
             .from(value.from)
             .to(value.to)
             .value(value.value.0)
-            .input(value.input.0.into())
+            .input(value.input.into())
             .access_list(value.access_list.into())
     }
 }

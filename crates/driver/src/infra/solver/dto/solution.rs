@@ -6,8 +6,8 @@ use {
             liquidity,
         },
         infra::Solver,
-        util::Bytes,
     },
+    alloy::primitives::Bytes,
     app_data::AppDataHash,
     itertools::Itertools,
     model::{
@@ -150,7 +150,7 @@ impl Solutions {
                         .map(|interaction| eth::Interaction {
                             target: interaction.target,
                             value: interaction.value.into(),
-                            call_data: Bytes(interaction.calldata),
+                            call_data: Bytes::from(interaction.calldata),
                         })
                         .collect(),
                     solution
@@ -227,7 +227,7 @@ impl Solutions {
                         .map(|interaction| eth::Interaction {
                             target: interaction.target,
                             value: interaction.value.into(),
-                            call_data: Bytes(interaction.calldata),
+                            call_data: interaction.calldata.into(),
                         })
                         .collect(),
                     solver.clone(),
@@ -328,11 +328,13 @@ impl JitOrder {
 
         let signer = signature
             .to_boundary_signature()
-            .recover_owner(
-                self.0.signature.as_slice(),
-                &DomainSeparator(domain_separator.0),
-                &self.raw_order_data().hash_struct(),
-            )
+            .and_then(|sig| {
+                sig.recover_owner(
+                    self.0.signature.as_slice(),
+                    &DomainSeparator(domain_separator.0),
+                    &self.raw_order_data().hash_struct(),
+                )
+            })
             .map_err(|e| super::Error(e.to_string()))?;
 
         if matches!(
@@ -343,7 +345,7 @@ impl JitOrder {
             // signature bytes. This leads to the owner being encoded twice in
             // the final settlement calldata unless we remove that from the raw
             // data.
-            signature.data = Bytes(self.0.signature[20..].to_vec());
+            signature.data = Bytes::copy_from_slice(&self.0.signature[20..]);
         }
 
         signature.signer = signer;

@@ -8,9 +8,9 @@ use {
         routing::get,
     },
     model::quote::NativeTokenPrice,
-    observe::distributed_tracing::tracing_axum::{make_span, record_trace_id},
+    observe::tracing::distributed::axum::{make_span, record_trace_id},
+    price_estimation::{PriceEstimationError, native::NativePriceEstimating},
     serde::Deserialize,
-    shared::price_estimation::{PriceEstimationError, native::NativePriceEstimating},
     std::{
         net::SocketAddr,
         ops::RangeInclusive,
@@ -45,14 +45,14 @@ pub async fn serve(
     estimator: Arc<dyn NativePriceEstimating>,
     max_timeout: Duration,
     shutdown: oneshot::Receiver<()>,
-) -> Result<(), hyper::Error> {
+) -> Result<(), std::io::Error> {
     let state = State {
         estimator,
         allowed_timeout: MIN_TIMEOUT..=max_timeout,
     };
 
     let app = Router::new()
-        .route("/native_price/:token", get(get_native_price))
+        .route("/native_price/{token}", get(get_native_price))
         .with_state(state)
         .layer(
             tower::ServiceBuilder::new()
@@ -60,10 +60,10 @@ pub async fn serve(
                 .map_request(record_trace_id),
         );
 
-    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(?addr, "serving HTTP API");
 
-    server
+    axum::serve(listener, app)
         .with_graceful_shutdown(async {
             shutdown.await.ok();
         })
@@ -83,17 +83,7 @@ async fn get_native_price(
 
     let start = Instant::now();
     match state.estimator.estimate_native_price(token, timeout).await {
-        Ok(price) => {
-            let elapsed = start.elapsed();
-            tracing::debug!(
-                ?token,
-                ?timeout,
-                ?elapsed,
-                ?price,
-                "estimated native token price"
-            );
-            Json(NativeTokenPrice { price }).into_response()
-        }
+        Ok(price) => Json(NativeTokenPrice { price }).into_response(),
         Err(err) => {
             let elapsed = start.elapsed();
             tracing::warn!(

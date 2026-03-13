@@ -6,6 +6,8 @@ use {
             ext::{AnvilApi, ImpersonateConfig},
         },
     },
+    autopilot::config::{Configuration, solver::Solver},
+    configs::test_util::TestDefault,
     contracts::alloy::{
         ERC20,
         support::{Balances, Signatures},
@@ -29,7 +31,7 @@ use {
         signature::EcdsaSigningScheme,
     },
     number::units::EthUnit,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
     solvers_dto::solution::{
         BuyTokenBalance,
         Call,
@@ -69,14 +71,15 @@ async fn cow_amm_jit(web3: Web3) {
     .await;
 
     // set up cow_amm
-    let oracle =
-        contracts::alloy::cow_amm::CowAmmUniswapV2PriceOracle::Instance::deploy(web3.alloy.clone())
-            .await
-            .unwrap();
+    let oracle = contracts::alloy::cow_amm::CowAmmUniswapV2PriceOracle::Instance::deploy(
+        web3.provider.clone(),
+    )
+    .await
+    .unwrap();
 
     let cow_amm_factory =
         contracts::alloy::cow_amm::CowAmmConstantProductFactory::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *onchain.contracts().gp_settlement.address(),
         )
         .await
@@ -146,13 +149,13 @@ async fn cow_amm_jit(web3: Web3) {
         .send_and_watch()
         .await
         .unwrap();
-    let cow_amm = contracts::alloy::cow_amm::CowAmm::Instance::new(cow_amm, web3.alloy.clone());
+    let cow_amm = contracts::alloy::cow_amm::CowAmm::Instance::new(cow_amm, web3.provider.clone());
 
     // Start system with the regular baseline solver as a quoter but a mock solver
     // for the actual solver competition. That way we can handcraft a solution
     // for this test and don't have to implement complete support for CoW AMMs
     // in the baseline solver.
-    let mock_solver = Mock::default();
+    let mock_solver = Mock::new().await;
     colocation::start_driver(
         onchain.contracts(),
         vec![
@@ -172,36 +175,40 @@ async fn cow_amm_jit(web3: Web3) {
                 base_tokens: vec![],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
         false,
     );
     let services = Services::new(&onchain).await;
+
     services
         .start_autopilot(
             None,
             vec![
-                format!(
-                    "--drivers=mock_solver|http://localhost:11088/mock_solver|{}",
-                    const_hex::encode(solver.address())
-                ),
                 "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
                     .to_string(),
             ],
+            Configuration::test("mock_solver", solver.address()),
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Derive the order's valid_to from the blockchain because the cow amm enforces
     // a relatively small valid_to and we initialize the chain with a date in
     // the past so the computer's current time is way ahead of the blockchain.
     let block = web3
-        .alloy
+        .provider
         .get_block(alloy::eips::BlockId::latest())
         .await
         .unwrap()
@@ -382,10 +389,10 @@ async fn cow_amm_driver_support(web3: Web3) {
     // since changing the forked number would result in very costly ~1 year of event
     // syncing, we deploy the following SCs
     let deployed_contracts = {
-        let balances = Balances::Instance::deploy(web3.alloy.clone())
+        let balances = Balances::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
-        let signatures = Signatures::Instance::deploy(web3.alloy.clone())
+        let signatures = Signatures::Instance::deploy(web3.provider.clone())
             .await
             .unwrap();
         DeployedContracts {
@@ -404,12 +411,12 @@ async fn cow_amm_driver_support(web3: Web3) {
     // create necessary token instances
     let usdc = ERC20::Instance::new(
         address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
-        web3.alloy.clone(),
+        web3.provider.clone(),
     );
 
     let usdt = ERC20::Instance::new(
         address!("dac17f958d2ee523a2206206994597c13d831ec7"),
-        web3.alloy.clone(),
+        web3.provider.clone(),
     );
 
     // Unbalance the cow amm enough that baseline is able to rebalance
@@ -452,7 +459,7 @@ async fn cow_amm_driver_support(web3: Web3) {
     // settle.
 
     // Give trader some USDC
-    web3.alloy
+    web3.provider
         .anvil_send_impersonated_transaction_with_config(
             usdc.transfer(trader.address(), 1000u64.matom())
                 .from(USDC_WHALE_MAINNET)
@@ -479,14 +486,14 @@ async fn cow_amm_driver_support(web3: Web3) {
     const ZERO_BALANCE_AMM: Address = address!("b3bf81714f704720dcb0351ff0d42eca61b069fc");
     let pendle_token = ERC20::Instance::new(
         address!("808507121b80c02388fad14726482e061b8da827"),
-        web3.alloy.clone(),
+        web3.provider.clone(),
     );
     let balance = pendle_token
         .balanceOf(ZERO_BALANCE_AMM)
         .call()
         .await
         .unwrap();
-    web3.alloy
+    web3.provider
         .anvil_send_impersonated_transaction_with_config(
             pendle_token
                 .transfer(
@@ -516,7 +523,7 @@ async fn cow_amm_driver_support(web3: Web3) {
     );
 
     // spawn a mock solver so we can later assert things about the received auction
-    let mock_solver = Mock::default();
+    let mock_solver = Mock::new().await;
     colocation::start_driver_with_config_override(
         onchain.contracts(),
         vec![
@@ -536,6 +543,8 @@ async fn cow_amm_driver_support(web3: Web3) {
                 base_tokens: vec![],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
@@ -554,18 +563,28 @@ factory = "0xf76c421bAb7df8548604E60deCCcE50477C10462"
         .start_autopilot(
             None,
             vec![
-                format!("--drivers=test_solver|http://localhost:11088/test_solver|{},mock_solver|http://localhost:11088/mock_solver|{}", const_hex::encode(solver.address()), const_hex::encode(solver.address())),
                 "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
                     .to_string(),
                 // it uses an older helper contract that was deployed before the desired cow amm
                 "--cow-amm-configs=0xf76c421bAb7df8548604E60deCCcE50477C10462|0x3FF0041A614A9E6Bf392cbB961C97DA214E9CB31|20476672".to_string()
             ],
+            Configuration {
+                drivers: vec![
+                    Solver::test("test_solver", solver.address()),
+                    Solver::test("mock_solver", solver.address()),
+                ],
+                ..Configuration::test_no_drivers()
+            }
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=test_solver|http://localhost:11088/test_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     onchain.mint_block().await;
@@ -690,14 +709,15 @@ async fn cow_amm_opposite_direction(web3: Web3) {
     // the user order.
 
     // Set up the CoW AMM as before
-    let oracle =
-        contracts::alloy::cow_amm::CowAmmUniswapV2PriceOracle::Instance::deploy(web3.alloy.clone())
-            .await
-            .unwrap();
+    let oracle = contracts::alloy::cow_amm::CowAmmUniswapV2PriceOracle::Instance::deploy(
+        web3.provider.clone(),
+    )
+    .await
+    .unwrap();
 
     let cow_amm_factory =
         contracts::alloy::cow_amm::CowAmmConstantProductFactory::Instance::deploy(
-            web3.alloy.clone(),
+            web3.provider.clone(),
             *onchain.contracts().gp_settlement.address(),
         )
         .await
@@ -780,11 +800,11 @@ async fn cow_amm_opposite_direction(web3: Web3) {
         .await
         .unwrap();
     let cow_amm =
-        contracts::alloy::cow_amm::CowAmm::Instance::new(cow_amm_address, web3.alloy.clone());
+        contracts::alloy::cow_amm::CowAmm::Instance::new(cow_amm_address, web3.provider.clone());
 
     // Start system with the mocked solver. Baseline is still required for the
     // native price estimation.
-    let mock_solver = Mock::default();
+    let mock_solver = Mock::new().await;
     colocation::start_driver(
         onchain.contracts(),
         vec![
@@ -804,34 +824,38 @@ async fn cow_amm_opposite_direction(web3: Web3) {
                 base_tokens: vec![],
                 merge_solutions: true,
                 haircut_bps: 0,
+                submission_keys: vec![],
+                forwarder_contract: None,
             },
         ],
         colocation::LiquidityProvider::UniswapV2,
         true,
     );
     let services = Services::new(&onchain).await;
+
     services
         .start_autopilot(
             None,
             vec![
-                format!(
-                    "--drivers=mock_solver|http://localhost:11088/mock_solver|{}",
-                    const_hex::encode(solver.address())
-                ),
                 "--price-estimation-drivers=mock_solver|http://localhost:11088/mock_solver"
                     .to_string(),
             ],
+            Configuration::test("mock_solver", solver.address()),
         )
         .await;
     services
-        .start_api(vec![
-            "--price-estimation-drivers=mock_solver|http://localhost:11088/mock_solver".to_string(),
-        ])
+        .start_api(
+            vec![
+                "--price-estimation-drivers=mock_solver|http://localhost:11088/mock_solver"
+                    .to_string(),
+            ],
+            orderbook::config::Configuration::test_default(),
+        )
         .await;
 
     // Get the current block timestamp
     let block = web3
-        .alloy
+        .provider
         .get_block(alloy::eips::BlockId::latest())
         .await
         .unwrap()

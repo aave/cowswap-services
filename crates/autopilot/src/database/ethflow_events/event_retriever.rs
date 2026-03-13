@@ -8,7 +8,8 @@ use {
         sol_types::SolEvent,
     },
     contracts::alloy::CoWSwapEthFlow::CoWSwapEthFlow,
-    shared::{ethrpc::Web3, event_handling::AlloyEventRetrieving},
+    ethrpc::Web3,
+    event_indexing::event_handler::AlloyEventRetrieving,
 };
 
 pub struct EthFlowRefundRetriever {
@@ -30,7 +31,7 @@ impl AlloyEventRetrieving for EthFlowRefundRetriever {
     type Event = CoWSwapEthFlow::CoWSwapEthFlowEvents;
 
     fn provider(&self) -> &alloy::providers::DynProvider {
-        &self.web3.alloy
+        &self.web3.provider
     }
 
     fn filter(&self) -> alloy::rpc::types::Filter {

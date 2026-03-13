@@ -4,12 +4,10 @@ use {
         domain::competition::{Order, order, risk_detector::Quality},
         infra::{self, observe::metrics},
     },
+    bad_tokens::{TokenQuality, trace_call::TraceCallDetectorRaw},
     futures::FutureExt,
     model::interaction::InteractionData,
-    shared::{
-        bad_token::{TokenQuality, trace_call::TraceCallDetectorRaw},
-        request_sharing::BoxRequestSharing,
-    },
+    request_sharing::BoxRequestSharing,
     std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -67,7 +65,7 @@ impl Detector {
                     .map(|i| InteractionData {
                         target: i.target,
                         value: i.value.0,
-                        call_data: i.call_data.0.clone(),
+                        call_data: i.call_data.to_vec(),
                     })
                     .collect();
                 let trader = order.trader().0;

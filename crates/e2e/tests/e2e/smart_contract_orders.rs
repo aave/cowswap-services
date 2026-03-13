@@ -1,5 +1,6 @@
 use {
     ::alloy::primitives::{Address, U256},
+    configs::test_util::TestDefault,
     e2e::setup::{safe::Safe, *},
     ethrpc::alloy::CallBuilderExt,
     model::{
@@ -7,8 +8,9 @@ use {
         signature::Signature,
     },
     number::units::EthUnit,
+    orderbook::config::order_validation::OrderValidationConfig,
     reqwest::StatusCode,
-    shared::ethrpc::Web3,
+    shared::web3::Web3,
 };
 
 #[tokio::test]
@@ -29,7 +31,7 @@ async fn smart_contract_orders(web3: Web3) {
     let [solver] = onchain.make_solvers(1u64.eth()).await;
     let [trader] = onchain.make_accounts(1u64.eth()).await;
 
-    let safe = Safe::deploy(trader, web3.alloy.clone()).await;
+    let safe = Safe::deploy(trader, web3.provider.clone()).await;
 
     let [token] = onchain
         .deploy_tokens_with_weth_uni_v2_pools(100_000u64.eth(), 100_000u64.eth())
@@ -155,7 +157,7 @@ async fn erc1271_gas_limit(web3: Web3) {
     let mut onchain = OnchainComponents::deploy(web3.clone()).await;
 
     let [solver] = onchain.make_solvers(1u64.eth()).await;
-    let trader = contracts::alloy::test::GasHog::Instance::deploy(web3.alloy.clone())
+    let trader = contracts::alloy::test::GasHog::Instance::deploy(web3.provider.clone())
         .await
         .unwrap();
 
@@ -175,9 +177,14 @@ async fn erc1271_gas_limit(web3: Web3) {
     let services = Services::new(&onchain).await;
     services
         .start_protocol_with_args(
-            ExtraServiceArgs {
-                api: vec!["--max-gas-per-order=1000000".to_string()],
-                ..Default::default()
+            Default::default(),
+            autopilot::config::Configuration::test("test_solver", solver.address()),
+            orderbook::config::Configuration {
+                order_validation: OrderValidationConfig {
+                    max_gas_per_order: 1_000_000,
+                    ..Default::default()
+                },
+                ..orderbook::config::Configuration::test_default()
             },
             solver,
         )

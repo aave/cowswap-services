@@ -16,21 +16,19 @@ use {
         BalancerV2WeightedPoolFactory,
         BalancerV2WeightedPoolFactoryV3,
     },
-    ethrpc::block_stream::{BlockRetrieving, CurrentBlockWatcher},
-    shared::{
-        http_solver::model::TokenAmount,
-        sources::balancer_v2::{
-            BalancerPoolFetcher,
-            pool_fetching::{BalancerContracts, BalancerFactoryInstance},
-        },
-        token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
+    ethrpc::block_stream::CurrentBlockWatcher,
+    event_indexing::block_retriever::BlockRetrieving,
+    liquidity_sources::balancer_v2::{
+        BalancerPoolFetcher,
+        pool_fetching::{BalancerContracts, BalancerFactoryInstance},
     },
+    shared::http_solver::model::TokenAmount,
     solver::{
-        interactions::allowances::Allowances,
         liquidity::balancer_v2::{self, BalancerV2Liquidity},
         liquidity_collector::{BackgroundInitLiquiditySource, LiquidityCollecting},
     },
     std::sync::Arc,
+    token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
 };
 
 pub mod stable;
@@ -54,7 +52,6 @@ fn to_interaction(
         // change this assumption, we would need to change it there as well.
         *receiver,
         pool.vault.0,
-        Allowances::empty(*receiver),
     );
 
     let interaction = handler.swap(
@@ -104,7 +101,7 @@ async fn init_liquidity(
 ) -> Result<impl LiquidityCollecting + use<>> {
     let web3 = eth.web3().clone();
     let contracts = BalancerContracts {
-        vault: BalancerV2Vault::Instance::new(config.vault.0, web3.alloy.clone()),
+        vault: BalancerV2Vault::Instance::new(config.vault.0, web3.provider.clone()),
         factories: [
             config
                 .weighted
@@ -112,7 +109,7 @@ async fn init_liquidity(
                 .map(|&factory| {
                     BalancerFactoryInstance::Weighted(BalancerV2WeightedPoolFactory::Instance::new(
                         factory,
-                        web3.alloy.clone(),
+                        web3.provider.clone(),
                     ))
                 })
                 .collect::<Vec<_>>(),
@@ -121,7 +118,10 @@ async fn init_liquidity(
                 .iter()
                 .map(|&factory| {
                     BalancerFactoryInstance::WeightedV3(
-                        BalancerV2WeightedPoolFactoryV3::Instance::new(factory, web3.alloy.clone()),
+                        BalancerV2WeightedPoolFactoryV3::Instance::new(
+                            factory,
+                            web3.provider.clone(),
+                        ),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -131,7 +131,7 @@ async fn init_liquidity(
                 .map(|&factory| {
                     BalancerFactoryInstance::StableV2(BalancerV2StablePoolFactoryV2::Instance::new(
                         factory,
-                        web3.alloy.clone(),
+                        web3.provider.clone(),
                     ))
                 })
                 .collect::<Vec<_>>(),
@@ -142,7 +142,7 @@ async fn init_liquidity(
                     BalancerFactoryInstance::LiquidityBootstrapping(
                         BalancerV2LiquidityBootstrappingPoolFactory::Instance::new(
                             factory,
-                            web3.alloy.clone(),
+                            web3.provider.clone(),
                         ),
                     )
                 })
@@ -154,7 +154,7 @@ async fn init_liquidity(
                     BalancerFactoryInstance::ComposableStable(
                         BalancerV2ComposableStablePoolFactory::Instance::new(
                             factory,
-                            web3.alloy.clone(),
+                            web3.provider.clone(),
                         ),
                     )
                 })
@@ -185,7 +185,6 @@ async fn init_liquidity(
     );
 
     Ok(BalancerV2Liquidity::new(
-        web3,
         balancer_pool_fetcher,
         *eth.contracts().settlement().address(),
         *contracts.vault.address(),

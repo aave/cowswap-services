@@ -39,6 +39,14 @@ servers:
     url: "https://api.cow.fi/bnb"
   - description: BNB (Staging)
     url: "https://barn.api.cow.fi/bnb"
+  - description: Plasma (Prod)
+    url: "https://api.cow.fi/plasma"
+  - description: Plasma (Staging)
+    url: "https://barn.api.cow.fi/plasma"
+  - description: Ink (Prod)
+    url: "https://api.cow.fi/ink"
+  - description: Ink (Staging)
+    url: "https://barn.api.cow.fi/ink"
   - description: Sepolia (Prod)
     url: "https://api.cow.fi/sepolia"
   - description: Sepolia (Staging)
@@ -77,6 +85,8 @@ paths:
           description: "Forbidden, your account is deny-listed."
         "404":
           description: No route was found quoting the order.
+        "422":
+          description: Unable to parse request body as valid JSON.
         "429":
           description: Too many order placements.
         "500":
@@ -117,6 +127,62 @@ paths:
           description: Invalid signature.
         "404":
           description: One or more orders were not found and no orders were cancelled.
+        "422":
+          description: Unable to parse request body as valid JSON.
+  "/api/v1/orders/by_uids":
+    post:
+      operationId: getOrders
+      summary: Get existing orders from the list of UIDs.
+      description: |
+        Returns an array where each element is an object with either
+        an "order" key containing the full order, or an "error" key
+        containing the UID and a description of what went wrong.
+      requestBody:
+        description: The list of up to 128 order uids to fetch
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/UID"
+      responses:
+        "200":
+          description: |
+            The resulting full order data based on the request. Each element of the array is
+            an object of the following format:
+            - `{"order": <Order>}` for successfully fetched orders
+            - `{"error": {"uid": "<UID>", "description": "<message>"}}` for orders that failed conversion
+            The result ordering is not guaranteed and might differ from the order of requested UIDs.
+            Orders that do not exist in the database will be missing from the response.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      order:
+                        $ref: "#/components/schemas/Order"
+                    required:
+                      - order
+                  - type: object
+                    properties:
+                      error:
+                        type: object
+                        properties:
+                          uid:
+                            $ref: "#/components/schemas/UID"
+                          description:
+                            type: string
+                        required:
+                          - uid
+                          - description
+                    required:
+                      - error
+        "400":
+          description: Request array size larger than 128 or unable to parse request body as valid JSON.
+        "422":
+          description: Could not decode array values as order UID.
   "/api/v1/orders/{UID}":
     get:
       operationId: getOrder
@@ -134,6 +200,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Order"
+        "400":
+          description: Invalid order UID.
         "404":
           description: Order was not found.
     delete:
@@ -173,6 +241,8 @@ paths:
           description: Invalid signature.
         "404":
           description: Order was not found.
+        "422":
+          description: Unable to parse request body as valid JSON.
   "/api/v1/orders/{UID}/status":
     get:
       operationId: getOrderStatus
@@ -192,6 +262,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CompetitionOrderStatus"
+        "400":
+          description: Invalid order UID.
   "/api/v1/transactions/{txHash}/orders":
     get:
       operationId: getOrdersByTxHash
@@ -211,6 +283,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Order"
+        "400":
+          description: Invalid transaction hash.
   /api/v1/trades:
     get:
       operationId: getTrades
@@ -433,6 +507,8 @@ paths:
                 $ref: "#/components/schemas/PriceEstimationError"
         "404":
           description: No route was found for the specified order.
+        "422":
+          description: Unable to parse request body as valid JSON.
         "429":
           description: Too many order quotes.
         "500":
@@ -457,6 +533,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolverCompetitionResponse"
+        "400":
+          description: Invalid auction ID.
         "404":
           description: No competition information available for this auction id.
   "/api/v1/solver_competition/by_tx_hash/{tx_hash}":
@@ -480,6 +558,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolverCompetitionResponse"
+        "400":
+          description: Invalid transaction hash.
         "404":
           description: No competition information available for this `tx_hash`.
   /api/v1/solver_competition/latest:
@@ -517,6 +597,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolverCompetitionResponse"
+        "400":
+          description: Invalid auction ID.
         "404":
           description: No competition information available for this auction id.
   "/api/v2/solver_competition/by_tx_hash/{tx_hash}":
@@ -539,6 +621,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolverCompetitionResponse"
+        "400":
+          description: Invalid transaction hash.
         "404":
           description: No competition information available for this `tx_hash`.
   /api/v2/solver_competition/latest:
@@ -585,6 +669,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AppDataObject"
+        "400":
+          description: Invalid app data hash.
         "404":
           description: No full `appData` stored for this hash.
     put:
@@ -622,6 +708,8 @@ paths:
                 $ref: "#/components/schemas/AppDataHash"
         "400":
           description: Error validating full `appData`
+        "422":
+          description: Unable to parse request body as valid JSON.
         "500":
           description: Error storing the full `appData`
   /api/v1/app_data:
@@ -653,6 +741,8 @@ paths:
                 $ref: "#/components/schemas/AppDataHash"
         "400":
           description: Error validating full `appData`
+        "422":
+          description: Unable to parse request body as valid JSON.
         "500":
           description: Error storing the full `appData`
   "/api/v1/users/{address}/total_surplus":
@@ -677,6 +767,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TotalSurplus"
+        "400":
+          description: Invalid address.
 components:
   schemas:
     TransactionHash:
@@ -1472,7 +1564,7 @@ components:
       properties:
         orderUids:
           type: array
-          description: UIDs of orders to cancel.
+          description: Up to 128 UIDs of orders to cancel.
           items:
             $ref: "#/components/schemas/UID"
         signature:
@@ -1639,7 +1731,9 @@ components:
             - UnsupportedToken
             - InvalidAppData
             - AppDataHashMismatch
+            - AppDataMismatch
             - AppdataFromMismatch
+            - MetadataSerializationFailed
             - OldOrderActivelyBidOn
         description:
           type: string
@@ -1672,7 +1766,7 @@ components:
           enum:
             - QuoteNotVerified
             - UnsupportedToken
-            - ZeroAmount
+            - NoLiquidity
             - UnsupportedOrderType
         description:
           type: string

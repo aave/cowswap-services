@@ -2,18 +2,15 @@
 //! the binaries.
 
 use {
-    crate::{
-        gas_price_estimation::GasEstimatorType,
-        sources::{BaselineSource, uniswap_v2::UniV2BaselineSourceParameters},
-        tenderly_api,
-    },
+    crate::fee_factor::FeeFactor,
     alloy::primitives::Address,
     anyhow::{Context, Result, ensure},
+    gas_price_estimation::GasEstimatorType,
     observe::TracingConfig,
     std::{
         collections::HashSet,
         fmt::{self, Display, Formatter},
-        num::NonZeroU64,
+        num::NonZeroU32,
         str::FromStr,
         time::Duration,
     },
@@ -126,17 +123,31 @@ pub fn tracing_config(args: &TracingArguments, service_name: String) -> Option<T
     ))
 }
 
+// Matches SQLx default connection pool size.
+// SAFETY: 10 > 0
+pub const DB_MAX_CONNECTIONS_DEFAULT: NonZeroU32 = NonZeroU32::new(10).unwrap();
+
+#[derive(Debug, Clone, clap::Parser)]
+pub struct DatabasePoolConfig {
+    /// Maximum number of connections in the database connection pool.
+    #[clap(long, env, default_value_t = DB_MAX_CONNECTIONS_DEFAULT)]
+    pub db_max_connections: NonZeroU32,
+}
+
+impl Display for DatabasePoolConfig {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        writeln!(f, "db_max_connections: {}", self.db_max_connections)
+    }
+}
+
 #[derive(clap::Parser)]
 #[group(skip)]
 pub struct Arguments {
     #[clap(flatten)]
-    pub ethrpc: crate::ethrpc::Arguments,
+    pub ethrpc: crate::web3::Arguments,
 
     #[clap(flatten)]
     pub current_block: crate::current_block::Arguments,
-
-    #[clap(flatten)]
-    pub tenderly: tenderly_api::Arguments,
 
     #[clap(flatten)]
     pub logging: LoggingArguments,
@@ -174,64 +185,6 @@ pub struct Arguments {
     )]
     pub gas_estimators: Vec<GasEstimatorType>,
 
-    /// Base tokens used for finding multi-hop paths between multiple AMMs
-    /// Should be the most liquid tokens of the given network.
-    #[clap(long, env, use_value_delimiter = true)]
-    pub base_tokens: Vec<Address>,
-
-    /// Which Liquidity sources to be used by Price Estimator.
-    #[clap(long, env, value_enum, ignore_case = true, use_value_delimiter = true)]
-    pub baseline_sources: Option<Vec<BaselineSource>>,
-
-    /// List of non hardcoded univ2-like contracts.
-    ///
-    /// For example to add a univ2-like liquidity source the argument could be
-    /// set to
-    ///
-    /// 0x0000000000000000000000000000000000000001|0x0000000000000000000000000000000000000000000000000000000000000002
-    ///
-    /// which sets the router address to 0x01 and the init code digest to 0x02.
-    #[clap(long, env, value_enum, ignore_case = true, use_value_delimiter = true)]
-    pub custom_univ2_baseline_sources: Vec<UniV2BaselineSourceParameters>,
-
-    /// The number of blocks kept in the pool cache.
-    #[clap(long, env, default_value = "10")]
-    pub pool_cache_blocks: NonZeroU64,
-
-    /// The number of pairs that are automatically updated in the pool cache.
-    #[clap(long, env, default_value = "4")]
-    pub pool_cache_maximum_recent_block_age: u64,
-
-    /// How often to retry requests in the pool cache.
-    #[clap(long, env, default_value = "5")]
-    pub pool_cache_maximum_retries: u32,
-
-    /// How long to sleep in seconds between retries in the pool cache.
-    #[clap(long, env, default_value = "1s", value_parser = humantime::parse_duration)]
-    pub pool_cache_delay_between_retries: Duration,
-
-    /// If solvers should use internal buffers to improve solution quality.
-    #[clap(long, env, action = clap::ArgAction::Set, default_value = "false")]
-    pub use_internal_buffers: bool,
-
-    /// Value of the authorization header for the solver competition post api.
-    #[clap(long, env)]
-    pub solver_competition_auth: Option<String>,
-
-    /// If liquidity pool fetcher has caching mechanism, this argument defines
-    /// how old pool data is allowed to be before updating
-    #[clap(
-        long,
-        env,
-        default_value = "30s",
-        value_parser = humantime::parse_duration,
-    )]
-    pub liquidity_fetcher_max_age_update: Duration,
-
-    /// The number of pools to initially populate the UniswapV3 cache
-    #[clap(long, env, default_value = "100")]
-    pub max_pools_to_initialize_cache: usize,
-
     /// The time between new blocks on the network.
     #[clap(long, env, value_parser = humantime::parse_duration)]
     pub network_block_interval: Option<Duration>,
@@ -261,31 +214,6 @@ pub struct Arguments {
     /// Override address of the balancer vault contract.
     #[clap(long, env)]
     pub balancer_v2_vault_address: Option<Address>,
-
-    /// The amount of time a classification of a token into good or
-    /// bad is valid for.
-    #[clap(
-        long,
-        env,
-        default_value = "10m",
-        value_parser = humantime::parse_duration,
-    )]
-    pub token_quality_cache_expiry: Duration,
-
-    /// How long before expiry the token quality cache should try to update the
-    /// token quality in the background. This is useful to make sure that token
-    /// quality for every cached token is usable at all times. This value
-    /// has to be smaller than `token_quality_cache_expiry`
-    /// This configuration also affects the period of the token quality
-    /// maintenance job. Maintenance period =
-    /// `token_quality_cache_prefetch_time` / 2
-    #[clap(
-        long,
-        env,
-        default_value = "2m",
-        value_parser = humantime::parse_duration,
-    )]
-    pub token_quality_cache_prefetch_time: Duration,
 
     /// Custom volume fees for token buckets.
     /// Format: "factor:token1;token2;..." (e.g.,
@@ -373,20 +301,11 @@ impl Display for Arguments {
         let Self {
             ethrpc,
             current_block,
-            tenderly,
             logging,
             node_url,
             chain_id,
             simulation_node_url,
             gas_estimators,
-            base_tokens,
-            baseline_sources,
-            pool_cache_blocks,
-            pool_cache_maximum_recent_block_age,
-            pool_cache_maximum_retries,
-            pool_cache_delay_between_retries,
-            use_internal_buffers,
-            solver_competition_auth,
             network_block_interval,
             settlement_contract_address,
             balances_contract_address,
@@ -394,11 +313,6 @@ impl Display for Arguments {
             native_token_address,
             hooks_contract_address,
             balancer_v2_vault_address,
-            custom_univ2_baseline_sources,
-            liquidity_fetcher_max_age_update,
-            max_pools_to_initialize_cache,
-            token_quality_cache_expiry,
-            token_quality_cache_prefetch_time,
             tracing,
             volume_fee_bucket_overrides,
             enable_sell_equals_buy_volume_fee,
@@ -406,33 +320,11 @@ impl Display for Arguments {
 
         write!(f, "{ethrpc}")?;
         write!(f, "{current_block}")?;
-        write!(f, "{tenderly}")?;
         write!(f, "{logging}")?;
         writeln!(f, "node_url: {node_url}")?;
         display_option(f, "chain_id", chain_id)?;
         display_option(f, "simulation_node_url", simulation_node_url)?;
         writeln!(f, "gas_estimators: {gas_estimators:?}")?;
-        writeln!(f, "base_tokens: {base_tokens:?}")?;
-        writeln!(f, "baseline_sources: {baseline_sources:?}")?;
-        writeln!(f, "pool_cache_blocks: {pool_cache_blocks}")?;
-        writeln!(
-            f,
-            "pool_cache_maximum_recent_block_age: {pool_cache_maximum_recent_block_age}"
-        )?;
-        writeln!(
-            f,
-            "pool_cache_maximum_retries: {pool_cache_maximum_retries}"
-        )?;
-        writeln!(
-            f,
-            "pool_cache_delay_between_retries: {pool_cache_delay_between_retries:?}"
-        )?;
-        writeln!(f, "use_internal_buffers: {use_internal_buffers}")?;
-        display_secret_option(
-            f,
-            "solver_competition_auth",
-            solver_competition_auth.as_ref(),
-        )?;
         display_option(
             f,
             "network_block_interval",
@@ -467,27 +359,6 @@ impl Display for Arguments {
             f,
             "balancer_v2_vault_address",
             &balancer_v2_vault_address.map(|a| format!("{a:?}")),
-        )?;
-        display_list(
-            f,
-            "custom_univ2_baseline_sources",
-            custom_univ2_baseline_sources,
-        )?;
-        writeln!(
-            f,
-            "liquidity_fetcher_max_age_update: {liquidity_fetcher_max_age_update:?}"
-        )?;
-        writeln!(
-            f,
-            "max_pools_to_initialize_cache: {max_pools_to_initialize_cache}"
-        )?;
-        writeln!(
-            f,
-            "token_quality_cache_expiry: {token_quality_cache_expiry:?}"
-        )?;
-        writeln!(
-            f,
-            "token_quality_cache_prefetch_time: {token_quality_cache_prefetch_time:?}"
         )?;
         write!(f, "{tracing:?}")?;
         writeln!(
@@ -524,51 +395,6 @@ impl FromStr for ExternalSolver {
             name: name.to_owned(),
             url,
         })
-    }
-}
-
-/// Fee factor representing a percentage in range [0, 1)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FeeFactor(f64);
-
-impl FeeFactor {
-    /// Number of basis points that make up 100%.
-    pub const MAX_BPS: u32 = 10_000;
-
-    pub fn new(factor: f64) -> Self {
-        Self(factor)
-    }
-
-    /// Converts the fee factor to basis points (BPS).
-    /// For example, 0.0002 -> 2 BPS
-    pub fn to_bps(&self) -> u64 {
-        (self.0 * f64::from(Self::MAX_BPS)).round() as u64
-    }
-
-    /// Get the inner value
-    pub fn get(&self) -> f64 {
-        self.0
-    }
-}
-
-impl TryFrom<f64> for FeeFactor {
-    type Error = anyhow::Error;
-
-    fn try_from(value: f64) -> Result<Self, Self::Error> {
-        ensure!(
-            (0.0..1.0).contains(&value),
-            "Factor must be in the range [0, 1)"
-        );
-        Ok(FeeFactor(value))
-    }
-}
-
-impl FromStr for FeeFactor {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: f64 = s.parse().context("failed to parse fee factor as f64")?;
-        value.try_into()
     }
 }
 

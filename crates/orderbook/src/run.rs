@@ -2,15 +2,18 @@ use {
     crate::{
         api,
         arguments::Arguments,
+        config::Configuration,
         database::Postgres,
         ipfs::Ipfs,
         ipfs_app_data::IpfsAppData,
         orderbook::Orderbook,
         quoter::QuoteHandler,
     },
+    account_balances::{self, BalanceSimulator},
     alloy::providers::Provider,
     anyhow::{Context, Result, anyhow},
     app_data::Validator,
+    bad_tokens::list_based::DenyListedTokens,
     chain::Chain,
     clap::Parser,
     contracts::alloy::{
@@ -18,44 +21,30 @@ use {
         ChainalysisOracle,
         GPv2Settlement,
         HooksTrampoline,
-        IUniswapV3Factory,
         WETH9,
         support::Balances,
     },
-    futures::{FutureExt, StreamExt},
-    model::{DomainSeparator, order::BUY_ETH_ADDRESS},
+    gas_price_estimation::gas_price::InstrumentedGasEstimator,
+    model::DomainSeparator,
     num::ToPrimitive,
     observe::metrics::{DEFAULT_METRICS_PORT, serve_metrics},
     order_validation,
+    price_estimation::{
+        PriceEstimating,
+        QuoteVerificationMode,
+        factory::{self, PriceEstimatorFactory},
+        native::{FallbackNativePriceEstimator, NativePriceEstimating},
+        trade_verifier::code_fetching::CachedCodeFetcher,
+    },
     shared::{
-        account_balances::{self, BalanceSimulator},
         arguments::tracing_config,
-        bad_token::{
-            cache::CachingDetector,
-            instrumented::InstrumentedBadTokenDetectorExt,
-            list_based::{ListBasedDetector, UnknownTokenStrategy},
-            token_owner_finder,
-            trace_call::TraceCallDetector,
-        },
-        baseline_solver::BaseTokens,
-        code_fetching::CachedCodeFetcher,
-        gas_price::InstrumentedGasEstimator,
         http_client::HttpClientFactory,
         order_quoting::{self, OrderQuoter},
         order_validation::{OrderValidPeriodConfiguration, OrderValidator},
-        price_estimation::{
-            PriceEstimating,
-            QuoteVerificationMode,
-            factory::{self, PriceEstimatorFactory},
-            native::NativePriceEstimating,
-        },
-        signature_validator,
-        sources::{self, BaselineSource, uniswap_v2::UniV2BaselineSourceParameters},
-        token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
     },
-    std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc, time::Duration},
+    std::{future::Future, net::SocketAddr, sync::Arc, time::Duration},
+    token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
     tokio::task::{self, JoinHandle},
-    warp::Filter,
 };
 
 pub async fn start(args: impl Iterator<Item = String>) {
@@ -66,30 +55,31 @@ pub async fn start(args: impl Iterator<Item = String>) {
         args.shared.logging.use_json_logs,
         tracing_config(&args.shared.tracing, "orderbook".into()),
     );
-    observe::tracing::initialize(&obs_config);
+    observe::tracing::init::initialize(&obs_config);
     tracing::info!("running order book with validated arguments:\n{}", args);
     observe::panic_hook::install();
     observe::metrics::setup_registry(Some("gp_v2_api".into()), None);
     #[cfg(unix)]
     observe::heap_dump_handler::spawn_heap_dump_handler();
-    run(args).await;
+    let config = Configuration::from_path(&args.config)
+        .await
+        .expect("failed to load configuration file");
+    tracing::info!("file configuration:\n{:#?}", config);
+    run(args, config).await;
 }
 
-pub async fn run(args: Arguments) {
+pub async fn run(args: Arguments, config: Configuration) {
     let http_factory = HttpClientFactory::new(&args.http_client);
 
-    let web3 = shared::ethrpc::web3(
-        &args.shared.ethrpc,
-        &http_factory,
-        &args.shared.node_url,
-        "base",
-    );
-    let simulation_web3 = args.shared.simulation_node_url.as_ref().map(|node_url| {
-        shared::ethrpc::web3(&args.shared.ethrpc, &http_factory, node_url, "simulation")
-    });
+    let web3 = shared::web3::web3(&args.shared.ethrpc, &args.shared.node_url, "base");
+    let simulation_web3 = args
+        .shared
+        .simulation_node_url
+        .as_ref()
+        .map(|node_url| shared::web3::web3(&args.shared.ethrpc, node_url, "simulation"));
 
     let chain_id = web3
-        .alloy
+        .provider
         .get_chain_id()
         .await
         .expect("Could not get chainId");
@@ -101,14 +91,14 @@ pub async fn run(args: Arguments) {
     }
 
     let settlement_contract = match args.shared.settlement_contract_address {
-        Some(address) => GPv2Settlement::Instance::new(address, web3.alloy.clone()),
-        None => GPv2Settlement::Instance::deployed(&web3.alloy)
+        Some(address) => GPv2Settlement::Instance::new(address, web3.provider.clone()),
+        None => GPv2Settlement::Instance::deployed(&web3.provider)
             .await
             .expect("load settlement contract"),
     };
     let balances_contract = match args.shared.balances_contract_address {
-        Some(address) => Balances::Instance::new(address, web3.alloy.clone()),
-        None => Balances::Instance::deployed(&web3.alloy.clone())
+        Some(address) => Balances::Instance::new(address, web3.provider.clone()),
+        None => Balances::Instance::deployed(&web3.provider.clone())
             .await
             .expect("load balances contract"),
     };
@@ -119,15 +109,15 @@ pub async fn run(args: Arguments) {
         .expect("Couldn't get vault relayer address");
     let signatures_contract = match args.shared.signatures_contract_address {
         Some(address) => {
-            contracts::alloy::support::Signatures::Instance::new(address, web3.alloy.clone())
+            contracts::alloy::support::Signatures::Instance::new(address, web3.provider.clone())
         }
-        None => contracts::alloy::support::Signatures::Instance::deployed(&web3.alloy)
+        None => contracts::alloy::support::Signatures::Instance::deployed(&web3.provider)
             .await
             .expect("load signatures contract"),
     };
     let native_token = match args.shared.native_token_address {
-        Some(address) => WETH9::Instance::new(address, web3.alloy.clone()),
-        None => WETH9::Instance::deployed(&web3.alloy)
+        Some(address) => WETH9::Instance::new(address, web3.provider.clone()),
+        None => WETH9::Instance::deployed(&web3.provider)
             .await
             .expect("load native token contract"),
     };
@@ -158,17 +148,15 @@ pub async fn run(args: Arguments) {
             }
         }
     });
-    let vault =
-        vault_address.map(|address| BalancerV2Vault::Instance::new(address, web3.alloy.clone()));
 
     let hooks_contract = match args.shared.hooks_contract_address {
-        Some(address) => HooksTrampoline::Instance::new(address, web3.alloy.clone()),
-        None => HooksTrampoline::Instance::deployed(&web3.alloy)
+        Some(address) => HooksTrampoline::Instance::new(address, web3.provider.clone()),
+        None => HooksTrampoline::Instance::deployed(&web3.provider)
             .await
             .expect("load hooks trampoline contract"),
     };
 
-    if !args.skip_domain_separator_verification {
+    if !config.skip_domain_separator_verification {
         verify_deployed_contract_constants(&settlement_contract, chain_id)
             .await
             .expect("Deployed contract constants don't match the ones in this binary");
@@ -176,13 +164,17 @@ pub async fn run(args: Arguments) {
         tracing::warn!("Skipping domain separator verification (useful for forks)");
     }
     let domain_separator = DomainSeparator::new(chain_id, *settlement_contract.address());
-    let postgres_write =
-        Postgres::try_new(args.db_write_url.as_str()).expect("failed to create database");
+    let db_config = crate::database::Config {
+        max_pool_size: config.database.max_connections.get(),
+    };
+    let postgres_write = Postgres::try_new(config.database.write_url.as_str(), db_config.clone())
+        .expect("failed to create database");
 
-    let postgres_read = if let Some(db_read_url) = args.db_read_url
-        && args.db_write_url != db_read_url
+    let postgres_read = if let Some(db_read_url) = config.database.read_url
+        && config.database.write_url != db_read_url
     {
-        Postgres::try_new(db_read_url.as_str()).expect("failed to create read replica databaseR")
+        Postgres::try_new(db_read_url.as_str(), db_config)
+            .expect("failed to create read replica database")
     } else {
         postgres_write.clone()
     };
@@ -199,8 +191,8 @@ pub async fn run(args: Arguments) {
     );
 
     let gas_price_estimator = Arc::new(InstrumentedGasEstimator::new(
-        shared::gas_price_estimation::create_priority_estimator(
-            &http_factory,
+        gas_price_estimation::create_priority_estimator(
+            http_factory.create(),
             &web3,
             args.shared.gas_estimators.as_slice(),
         )
@@ -208,85 +200,12 @@ pub async fn run(args: Arguments) {
         .expect("failed to create gas price estimator"),
     ));
 
-    let baseline_sources = args
-        .shared
-        .baseline_sources
-        .clone()
-        .unwrap_or_else(|| sources::defaults_for_network(&chain));
-    tracing::info!(?baseline_sources, "using baseline sources");
-    let univ2_sources = baseline_sources
-        .iter()
-        .filter_map(|source: &BaselineSource| {
-            UniV2BaselineSourceParameters::from_baseline_source(*source, &chain_id.to_string())
-        })
-        .chain(args.shared.custom_univ2_baseline_sources.iter().copied());
-    let pair_providers: Vec<_> = futures::stream::iter(univ2_sources)
-        .then(|source: UniV2BaselineSourceParameters| {
-            let web3 = &web3;
-            async move { source.into_source(web3).await.unwrap().pair_provider }
-        })
-        .collect()
-        .await;
-
-    let base_tokens = Arc::new(BaseTokens::new(
-        *native_token.address(),
-        &args.shared.base_tokens,
-    ));
-    let mut allowed_tokens = args.allowed_tokens.clone();
-    allowed_tokens.extend(base_tokens.tokens().iter());
-    allowed_tokens.push(BUY_ETH_ADDRESS);
-    let unsupported_tokens = args.unsupported_tokens.clone();
-
-    let uniswapv3_factory = IUniswapV3Factory::Instance::deployed(&web3.alloy)
-        .await
-        .inspect_err(|err| tracing::warn!(%err, "error while fetching IUniswapV3Factory instance"))
-        .ok();
-
-    let finder = token_owner_finder::init(
-        &args.token_owner_finder,
-        web3.clone(),
-        &chain,
-        &http_factory,
-        &pair_providers,
-        vault.as_ref(),
-        uniswapv3_factory.as_ref(),
-        &base_tokens,
-        *settlement_contract.address(),
-    )
-    .await
-    .expect("failed to initialize token owner finders");
-
-    let trace_call_detector = args.tracing_node_url.as_ref().map(|tracing_node_url| {
-        CachingDetector::new(
-            Box::new(TraceCallDetector::new(
-                shared::ethrpc::web3(
-                    &args.shared.ethrpc,
-                    &http_factory,
-                    tracing_node_url,
-                    "trace",
-                ),
-                *settlement_contract.address(),
-                finder,
-            )),
-            args.shared.token_quality_cache_expiry,
-            args.shared.token_quality_cache_prefetch_time,
-        )
-    });
-    let bad_token_detector = Arc::new(
-        ListBasedDetector::new(
-            allowed_tokens,
-            unsupported_tokens,
-            trace_call_detector
-                .map(|detector| UnknownTokenStrategy::Forward(detector))
-                .unwrap_or(UnknownTokenStrategy::Allow),
-        )
-        .instrumented(),
-    );
+    let deny_listed_tokens = DenyListedTokens::new(config.unsupported_tokens);
 
     let current_block_stream = args
         .shared
         .current_block
-        .stream(args.shared.node_url.clone(), web3.alloy.clone())
+        .stream(args.shared.node_url.clone(), web3.provider.clone())
         .await
         .unwrap();
 
@@ -298,7 +217,7 @@ pub async fn run(args: Arguments) {
 
     let mut price_estimator_factory = PriceEstimatorFactory::new(
         &args.price_estimation,
-        &args.shared,
+        &config.native_price_estimation.shared,
         factory::Network {
             web3: web3.clone(),
             simulation_web3,
@@ -310,12 +229,13 @@ pub async fn run(args: Arguments) {
                 .call()
                 .await
                 .expect("failed to query solver authenticator address"),
-            base_tokens: base_tokens.clone(),
             block_stream: current_block_stream.clone(),
         },
         factory::Components {
-            http_factory: http_factory.clone(),
-            bad_token_detector: bad_token_detector.clone(),
+            http_factory: price_estimation::utils::http_client_factory::HttpClientFactory::new(
+                http_factory.timeout,
+            ),
+            deny_listed_tokens: deny_listed_tokens.clone(),
             tokens: token_info_fetcher.clone(),
             code_fetcher: code_fetcher.clone(),
         },
@@ -323,16 +243,40 @@ pub async fn run(args: Arguments) {
     .await
     .expect("failed to initialize price estimator factory");
 
-    let native_price_estimator = price_estimator_factory
+    let prices = postgres_write.fetch_latest_prices().await.unwrap();
+    let cache = price_estimation::native_price_cache::Cache::new(
+        config.native_price_estimation.shared.cache.max_age,
+        prices,
+    );
+    let primary = price_estimator_factory
         .native_price_estimator(
-            args.native_price_estimators.as_slice(),
-            args.fast_price_estimation_results_required,
-            native_token.clone(),
+            config.native_price_estimation.estimators.as_slice(),
+            config.native_price_estimation.shared.results_required,
+            &native_token,
         )
         .await
-        .unwrap();
-    let prices = postgres_write.fetch_latest_prices().await.unwrap();
-    native_price_estimator.initialize_cache(prices);
+        .expect("failed to build primary native price estimator");
+
+    let inner: Box<dyn NativePriceEstimating> =
+        if let Some(ref fallback_config) = config.native_price_estimation.fallback_estimators {
+            let fallback = price_estimator_factory
+                .native_price_estimator(
+                    fallback_config.as_slice(),
+                    config.native_price_estimation.shared.results_required,
+                    &native_token,
+                )
+                .await
+                .expect("failed to build fallback native price estimator");
+            Box::new(FallbackNativePriceEstimator::new(primary, fallback))
+        } else {
+            primary
+        };
+
+    let native_price_estimator: Arc<dyn NativePriceEstimating> = Arc::new(
+        price_estimator_factory
+            .caching_native_price_estimator_from_inner(inner, cache)
+            .await,
+    );
 
     let price_estimator = price_estimator_factory
         .price_estimator(
@@ -340,7 +284,10 @@ pub async fn run(args: Arguments) {
                 .order_quoting
                 .price_estimation_drivers
                 .iter()
-                .map(|price_estimator| price_estimator.clone().into())
+                .map(|price_estimator_driver| price_estimation::ExternalSolver {
+                    name: price_estimator_driver.name.clone(),
+                    url: price_estimator_driver.url.clone(),
+                })
                 .collect::<Vec<_>>(),
             native_price_estimator.clone(),
             gas_price_estimator.clone(),
@@ -352,18 +299,21 @@ pub async fn run(args: Arguments) {
                 .order_quoting
                 .price_estimation_drivers
                 .iter()
-                .map(|price_estimator| price_estimator.clone().into())
+                .map(|price_estimator_driver| price_estimation::ExternalSolver {
+                    name: price_estimator_driver.name.clone(),
+                    url: price_estimator_driver.url.clone(),
+                })
                 .collect::<Vec<_>>(),
-            args.fast_price_estimation_results_required,
+            config.native_price_estimation.shared.results_required,
             native_price_estimator.clone(),
             gas_price_estimator.clone(),
         )
         .unwrap();
 
     let validity_configuration = OrderValidPeriodConfiguration {
-        min: args.min_order_validity_period,
-        max_market: args.max_order_validity_period,
-        max_limit: args.max_limit_order_validity_period,
+        min: config.order_validation.min_order_validity_period,
+        max_market: config.order_validation.max_order_validity_period,
+        max_limit: config.order_validation.max_limit_order_validity_period,
     };
 
     let create_quoter = |price_estimator: Arc<dyn PriceEstimating>,
@@ -399,40 +349,38 @@ pub async fn run(args: Arguments) {
     // them.
     let fast_quoter = create_quoter(fast_price_estimator, QuoteVerificationMode::Unverified);
 
-    let app_data_validator = Validator::new(args.app_data_size_limit);
-    let chainalysis_oracle = ChainalysisOracle::Instance::deployed(&web3.alloy)
+    let app_data_validator = Validator::new(config.app_data_size_limit);
+    let chainalysis_oracle = ChainalysisOracle::Instance::deployed(&web3.provider)
         .await
         .ok();
     let order_validator = Arc::new(OrderValidator::new(
         native_token,
         Arc::new(order_validation::banned::Users::new(
             chainalysis_oracle,
-            args.banned_users,
-            args.banned_users_max_cache_size.get().to_u64().unwrap(),
+            config.banned_users.addresses,
+            config.banned_users.max_cache_size.get().to_u64().unwrap(),
         )),
         validity_configuration,
-        args.eip1271_skip_creation_validation,
-        bad_token_detector.clone(),
+        config.eip1271_skip_creation_validation,
+        deny_listed_tokens.clone(),
         hooks_contract,
         optimal_quoter.clone(),
         balance_fetcher,
         signature_validator,
         Arc::new(postgres_write.clone()),
-        args.max_limit_orders_per_user,
+        config.order_validation.max_limit_orders_per_user,
         code_fetcher,
         app_data_validator.clone(),
-        args.max_gas_per_order,
-        args.same_tokens_policy,
+        config.order_validation.max_gas_per_order,
+        config.order_validation.same_tokens_policy,
     ));
-    let ipfs = args
-        .ipfs_gateway
-        .map(|url| {
-            Ipfs::new(
-                http_factory.builder(),
-                url,
-                args.ipfs_pinata_auth
-                    .map(|auth| format!("pinataGatewayToken={auth}")),
-            )
+    let ipfs = config
+        .ipfs
+        .map(|ipfs| {
+            let pinata_query = ipfs
+                .auth_token
+                .map(|auth| format!("pinataGatewayToken={auth}"));
+            Ipfs::new(http_factory.builder(), ipfs.gateway, pinata_query)
         })
         .map(IpfsAppData::new);
     let app_data = Arc::new(crate::app_data::Registry::new(
@@ -447,21 +395,19 @@ pub async fn run(args: Arguments) {
         postgres_read.clone(),
         order_validator.clone(),
         app_data.clone(),
-        args.active_order_competition_threshold,
+        config.active_order_competition_threshold,
     ));
 
     check_database_connection(orderbook.as_ref()).await;
-    let quotes = Arc::new(
-        QuoteHandler::new(
-            order_validator,
-            optimal_quoter,
-            app_data.clone(),
-            args.volume_fee_config,
-            args.shared.volume_fee_bucket_overrides.clone(),
-            args.shared.enable_sell_equals_buy_volume_fee,
-        )
-        .with_fast_quoter(fast_quoter),
-    );
+    let quotes = QuoteHandler::new(
+        order_validator,
+        optimal_quoter,
+        app_data.clone(),
+        config.volume_fee,
+        args.shared.volume_fee_bucket_overrides.clone(),
+        args.shared.enable_sell_equals_buy_volume_fee,
+    )
+    .with_fast_quoter(fast_quoter);
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
     let serve_api = serve_api(
@@ -542,14 +488,14 @@ fn serve_api(
     database: Postgres,
     database_replica: Postgres,
     orderbook: Arc<Orderbook>,
-    quotes: Arc<QuoteHandler>,
+    quotes: QuoteHandler,
     app_data: Arc<crate::app_data::Registry>,
     address: SocketAddr,
     shutdown_receiver: impl Future<Output = ()> + Send + 'static,
     native_price_estimator: Arc<dyn NativePriceEstimating>,
     quote_timeout: Duration,
 ) -> JoinHandle<()> {
-    let filter = api::handle_all_routes(
+    let app = api::handle_all_routes(
         database,
         database_replica,
         orderbook,
@@ -557,19 +503,24 @@ fn serve_api(
         app_data,
         native_price_estimator,
         quote_timeout,
-    )
-    .boxed();
+    );
     tracing::info!(%address, "serving order book");
-    let warp_svc = warp::service(filter);
-    let make_svc = hyper::service::make_service_fn(move |_| {
-        let svc = warp_svc.clone();
-        async move { Ok::<_, Infallible>(svc) }
-    });
-    let server = hyper::Server::bind(&address)
-        .serve(make_svc)
-        .with_graceful_shutdown(shutdown_receiver)
-        .map(|_| ());
-    task::spawn(server)
+
+    task::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(address).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::error!(?err, "failed to bind server");
+                return;
+            }
+        };
+        if let Err(err) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_receiver)
+            .await
+        {
+            tracing::error!(?err, "server error");
+        }
+    })
 }
 
 /// Check that important constants such as the EIP 712 Domain Separator and

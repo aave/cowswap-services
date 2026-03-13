@@ -1,23 +1,30 @@
 use {
-    crate::{app_data, database::Postgres, orderbook::Orderbook, quoter::QuoteHandler},
-    anyhow::Result,
-    observe::distributed_tracing::tracing_warp::make_span,
-    serde::{Deserialize, Serialize, de::DeserializeOwned},
-    shared::price_estimation::{PriceEstimationError, native::NativePriceEstimating},
+    crate::{
+        app_data,
+        database::Postgres,
+        orderbook::Orderbook,
+        quoter::QuoteHandler,
+        solver_competition::LoadSolverCompetitionError,
+    },
+    axum::{
+        Router,
+        extract::DefaultBodyLimit,
+        http::{Request, StatusCode, header::USER_AGENT},
+        middleware::{self, Next},
+        response::{IntoResponse, Json, Response},
+        routing::{delete, get, post, put},
+    },
+    observe::tracing::distributed::axum::{make_span, record_trace_id},
+    price_estimation::{PriceEstimationError, native::NativePriceEstimating},
+    serde::{Deserialize, Serialize},
     std::{
-        convert::Infallible,
+        borrow::Cow,
         fmt::Debug,
         sync::Arc,
         time::{Duration, Instant},
     },
-    warp::{
-        Filter,
-        Rejection,
-        Reply,
-        filters::BoxedFilter,
-        hyper::StatusCode,
-        reply::{Json, WithStatus, json, with_status},
-    },
+    tower::ServiceBuilder,
+    tower_http::{cors::CorsLayer, trace::TraceLayer},
 };
 
 mod cancel_order;
@@ -28,6 +35,7 @@ mod get_native_price;
 mod get_order_by_uid;
 mod get_order_status;
 mod get_orders_by_tx;
+mod get_orders_by_uid;
 mod get_solver_competition;
 mod get_solver_competition_v2;
 mod get_token_metadata;
@@ -40,128 +48,277 @@ mod post_quote;
 mod put_app_data;
 mod version;
 
+const ALLOWED_METHODS: &[axum::http::Method] = &[
+    axum::http::Method::GET,
+    axum::http::Method::POST,
+    axum::http::Method::DELETE,
+    axum::http::Method::OPTIONS,
+    axum::http::Method::PUT,
+    axum::http::Method::PATCH,
+    axum::http::Method::HEAD,
+];
+
+/// Centralized application state shared across all API handlers
+pub struct AppState {
+    pub database_write: Postgres,
+    pub database_read: Postgres,
+    pub orderbook: Arc<Orderbook>,
+    pub quotes: QuoteHandler,
+    pub app_data: Arc<app_data::Registry>,
+    pub native_price_estimator: Arc<dyn NativePriceEstimating>,
+    pub quote_timeout: Duration,
+}
+
+async fn summarize_request(req: Request<axum::body::Body>, next: Next) -> Response {
+    let method = req.method().to_string();
+    let uri = req.uri().to_string();
+
+    let user_agent = req
+        .headers()
+        .get(USER_AGENT)
+        .map(|user_agent| user_agent.to_str().unwrap_or("invalid (non-ASCII)"))
+        .unwrap_or("unset")
+        .to_string();
+
+    let timer = Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+
+    tracing::info!(
+        method,
+        uri,
+        user_agent,
+        status,
+        elapsed = ?timer.elapsed(),
+        "request_summary",
+    );
+
+    response
+}
+
+/// Middleware that automatically tracks metrics using Axum's MatchedPath
+async fn with_matched_path_metric(req: Request<axum::body::Body>, next: Next) -> Response {
+    let metrics = ApiMetrics::instance(observe::metrics::get_storage_registry()).unwrap();
+
+    let http_method = req.method().as_str();
+    let matched_path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str())
+        .unwrap_or("unknown");
+    let method_with_path = format!("{http_method} {matched_path}");
+
+    let response = {
+        let _timer = metrics
+            .requests_duration_seconds
+            .with_label_values(&[&method_with_path])
+            .start_timer();
+        next.run(req).await
+    };
+    let status = response.status();
+
+    // Track completed requests
+    metrics
+        .requests_complete
+        .with_label_values(&[method_with_path.as_str(), status.as_str()])
+        .inc();
+
+    // Track rejected requests (4xx and 5xx status codes)
+    if status.is_client_error() || status.is_server_error() {
+        metrics
+            .requests_rejected
+            .with_label_values(&[status.as_str()])
+            .inc();
+    }
+
+    response
+}
+
+const MAX_JSON_BODY_PAYLOAD: u64 = 1024 * 16;
+
 pub fn handle_all_routes(
     database_write: Postgres,
     database_read: Postgres,
     orderbook: Arc<Orderbook>,
-    quotes: Arc<QuoteHandler>,
+    quotes: QuoteHandler,
     app_data: Arc<app_data::Registry>,
     native_price_estimator: Arc<dyn NativePriceEstimating>,
     quote_timeout: Duration,
-) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
-    // Note that we add a string with endpoint's name to all responses.
-    // This string will be used later to report metrics.
-    // It is not used to form the actual server response.
+) -> Router {
+    let app_data_size_limit = app_data.size_limit();
 
-    let routes = vec![
+    let state = Arc::new(AppState {
+        database_write,
+        database_read,
+        orderbook,
+        quotes,
+        app_data,
+        native_price_estimator,
+        quote_timeout,
+    });
+
+    let routes = [
+        // V1 routes
         (
-            "v1/create_order",
-            box_filter(post_order::post_order(orderbook.clone())),
+            "GET",
+            "/api/v1/account/{owner}/orders",
+            get(get_user_orders::get_user_orders_handler),
         ),
         (
-            "v1/get_order",
-            box_filter(get_order_by_uid::get_order_by_uid(orderbook.clone())),
+            "PUT",
+            "/api/v1/app_data",
+            put(put_app_data::put_app_data_without_hash)
+                .layer(DefaultBodyLimit::max(app_data_size_limit)),
         ),
         (
-            "v1/get_order_status",
-            box_filter(get_order_status::get_status(orderbook.clone())),
+            "GET",
+            "/api/v1/app_data/{hash}",
+            get(get_app_data::get_app_data_handler),
         ),
         (
-            "v1/get_trades",
-            box_filter(get_trades::get_trades(database_read.clone())),
+            "PUT",
+            "/api/v1/app_data/{hash}",
+            put(put_app_data::put_app_data_with_hash)
+                .layer(DefaultBodyLimit::max(app_data_size_limit)),
         ),
         (
-            "v2/get_trades",
-            box_filter(get_trades_v2::get_trades(database_read.clone())),
+            "GET",
+            "/api/v1/auction",
+            get(get_auction::get_auction_handler),
         ),
         (
-            "v1/cancel_order",
-            box_filter(cancel_order::cancel_order(orderbook.clone())),
+            "POST",
+            "/api/v1/orders",
+            post(post_order::post_order_handler),
         ),
         (
-            "v1/cancel_orders",
-            box_filter(cancel_orders::filter(orderbook.clone())),
+            "POST",
+            "/api/v1/orders/by_uids",
+            post(get_orders_by_uid::get_orders_by_uid_handler),
         ),
         (
-            "v1/get_user_orders",
-            box_filter(get_user_orders::get_user_orders(orderbook.clone())),
+            "DELETE",
+            "/api/v1/orders",
+            delete(cancel_orders::cancel_orders_handler),
         ),
         (
-            "v1/get_orders_by_tx",
-            box_filter(get_orders_by_tx::get_orders_by_tx(orderbook.clone())),
-        ),
-        ("v1/post_quote", box_filter(post_quote::post_quote(quotes))),
-        (
-            "v1/auction",
-            box_filter(get_auction::get_auction(orderbook.clone())),
+            "GET",
+            "/api/v1/orders/{uid}",
+            get(get_order_by_uid::get_order_by_uid_handler),
         ),
         (
-            "v1/solver_competition",
-            box_filter(get_solver_competition::get(Arc::new(
-                database_write.clone(),
-            ))),
+            "DELETE",
+            "/api/v1/orders/{uid}",
+            delete(cancel_order::cancel_order_handler),
         ),
         (
-            "v2/solver_competition",
-            box_filter(get_solver_competition_v2::get(database_write.clone())),
+            "GET",
+            "/api/v1/orders/{uid}/status",
+            get(get_order_status::get_status_handler),
         ),
         (
-            "v1/solver_competition/latest",
-            box_filter(get_solver_competition::get_latest(Arc::new(
-                database_write.clone(),
-            ))),
+            "POST",
+            "/api/v1/quote",
+            post(post_quote::post_quote_handler),
+        ),
+        // /solver_competition routes (specific before parameterized)
+        (
+            "GET",
+            "/api/v1/solver_competition/latest",
+            get(get_solver_competition::get_solver_competition_latest_handler),
         ),
         (
-            "v2/solver_competition/latest",
-            box_filter(get_solver_competition_v2::get_latest(
-                database_write.clone(),
-            )),
-        ),
-        ("v1/version", box_filter(version::version())),
-        (
-            "v1/get_native_price",
-            box_filter(get_native_price::get_native_price(
-                native_price_estimator,
-                quote_timeout,
-            )),
+            "GET",
+            "/api/v1/solver_competition/by_tx_hash/{tx_hash}",
+            get(get_solver_competition::get_solver_competition_by_hash_handler),
         ),
         (
-            "v1/get_app_data",
-            get_app_data::get(database_read.clone()).boxed(),
+            "GET",
+            "/api/v1/solver_competition/{auction_id}",
+            get(get_solver_competition::get_solver_competition_by_id_handler),
         ),
         (
-            "v1/put_app_data",
-            box_filter(put_app_data::filter(app_data)),
+            "GET",
+            "/api/v1/token/{token}/metadata",
+            get(get_token_metadata::get_token_metadata_handler),
         ),
         (
-            "v1/get_total_surplus",
-            box_filter(get_total_surplus::get(database_read.clone())),
+            "GET",
+            "/api/v1/token/{token}/native_price",
+            get(get_native_price::get_native_price_handler),
+        ),
+        ("GET", "/api/v1/trades", get(get_trades::get_trades_handler)),
+        (
+            "GET",
+            "/api/v1/transactions/{hash}/orders",
+            get(get_orders_by_tx::get_orders_by_tx_handler),
         ),
         (
-            "v1/get_token_metadata",
-            box_filter(get_token_metadata::get_token_metadata(database_read)),
+            "GET",
+            "/api/v1/users/{user}/total_surplus",
+            get(get_total_surplus::get_total_surplus_handler),
+        ),
+        ("GET", "/api/v1/version", get(version::version_handler)),
+        // V2 routes
+        // /solver_competition routes (specific before parameterized)
+        (
+            "GET",
+            "/api/v2/solver_competition/latest",
+            get(get_solver_competition_v2::get_solver_competition_latest_handler),
+        ),
+        (
+            "GET",
+            "/api/v2/solver_competition/by_tx_hash/{tx_hash}",
+            get(get_solver_competition_v2::get_solver_competition_by_hash_handler),
+        ),
+        (
+            "GET",
+            "/api/v2/solver_competition/{auction_id}",
+            get(get_solver_competition_v2::get_solver_competition_by_id_handler),
+        ),
+        (
+            "GET",
+            "/api/v2/trades",
+            get(get_trades_v2::get_trades_handler),
         ),
     ];
 
-    finalize_router(routes, "orderbook::api::request_summary")
-}
-
-pub type ApiReply = WithStatus<Json>;
-
-// We turn Rejection into Reply to workaround warp not setting CORS headers on
-// rejections.
-async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
-    let response = err.default_response();
-
+    // Initialize metrics
     let metrics = ApiMetrics::instance(observe::metrics::get_storage_registry()).unwrap();
-    metrics
-        .requests_rejected
-        .with_label_values(&[response.status().as_str()])
-        .inc();
+    metrics.reset_requests_rejected();
 
-    Ok(response)
+    let mut api_router = Router::new();
+    for (method, path, method_router) in routes {
+        metrics.reset_requests_complete(method, path);
+        api_router = api_router.route(path, method_router);
+    }
+    let api_router = api_router.with_state(state);
+
+    let cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(ALLOWED_METHODS.to_vec())
+        .allow_headers(vec![
+            axum::http::header::ORIGIN,
+            axum::http::header::CONTENT_TYPE,
+            // Must be lower case due to the HTTP-2 spec
+            axum::http::HeaderName::from_static("x-auth-token"),
+            axum::http::HeaderName::from_static("x-appid"),
+        ]);
+
+    api_router
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_PAYLOAD as usize))
+        .layer(cors)
+        .layer(middleware::from_fn(summarize_request))
+        .layer(middleware::from_fn(with_matched_path_metric))
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http().make_span_with(make_span))
+                .map_request(record_trace_id),
+        )
 }
 
+// NOTE(jmg-duarte): method is actually the request path, to avoid breaking
+// dashboards, the http_method was added
 #[derive(prometheus_metric_storage::MetricStorage, Clone, Debug)]
 #[metric(subsystem = "api")]
 struct ApiMetrics {
@@ -200,43 +357,39 @@ impl ApiMetrics {
         }
     }
 
-    fn reset_requests_complete(&self, method: &str) {
+    fn reset_requests_complete(&self, method: &str, path: &str) {
+        let method_with_path = format!("{method} {path}");
         for status in Self::INITIAL_STATUSES {
             self.requests_complete
-                .with_label_values(&[method, status.as_str()])
+                .with_label_values(&[method_with_path.as_str(), status.as_str()])
                 .reset();
         }
-    }
-
-    fn on_request_completed(&self, method: &str, status: StatusCode, timer: Instant) {
-        self.requests_complete
-            .with_label_values(&[method, status.as_str()])
-            .inc();
-        self.requests_duration_seconds
-            .with_label_values(&[method])
-            .observe(timer.elapsed().as_secs_f64());
     }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Error<'a> {
-    pub error_type: &'a str,
-    pub description: &'a str,
+pub struct Error {
+    pub error_type: Cow<'static, str>,
+    pub description: Cow<'static, str>,
     /// Additional arbitrary data that can be attached to an API error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
 
-pub fn error(error_type: &str, description: impl AsRef<str>) -> Json {
-    json(&Error {
-        error_type,
-        description: description.as_ref(),
+pub fn error(error_type: &'static str, description: impl AsRef<str>) -> Json<Error> {
+    Json(Error {
+        error_type: error_type.into(),
+        description: Cow::Owned(description.as_ref().to_owned()),
         data: None,
     })
 }
 
-pub fn rich_error(error_type: &str, description: impl AsRef<str>, data: impl Serialize) -> Json {
+pub fn rich_error(
+    error_type: &'static str,
+    description: impl AsRef<str>,
+    data: impl Serialize,
+) -> Json<Error> {
     let data = match serde_json::to_value(&data) {
         Ok(value) => Some(value),
         Err(err) => {
@@ -245,146 +398,52 @@ pub fn rich_error(error_type: &str, description: impl AsRef<str>, data: impl Ser
         }
     };
 
-    json(&Error {
-        error_type,
-        description: description.as_ref(),
+    Json(Error {
+        error_type: error_type.into(),
+        description: Cow::Owned(description.as_ref().to_owned()),
         data,
     })
 }
 
-pub fn internal_error_reply() -> ApiReply {
-    with_status(
-        error("InternalServerError", ""),
+pub fn internal_error_reply() -> Response {
+    (
         StatusCode::INTERNAL_SERVER_ERROR,
+        error("InternalServerError", ""),
     )
+        .into_response()
 }
 
-pub fn convert_json_response<T, E>(result: Result<T, E>) -> WithStatus<Json>
-where
-    T: Serialize,
-    E: IntoWarpReply + Debug,
-{
-    match result {
-        Ok(response) => with_status(warp::reply::json(&response), StatusCode::OK),
-        Err(err) => err.into_warp_reply(),
-    }
-}
+// Newtype wrapper for PriceEstimationError to allow IntoResponse implementation
+// (orphan rules prevent implementing IntoResponse directly on external types)
+pub(crate) struct PriceEstimationErrorWrapper(pub(crate) PriceEstimationError);
 
-pub trait IntoWarpReply {
-    fn into_warp_reply(self) -> ApiReply;
-}
-
-pub async fn response_body(response: warp::hyper::Response<warp::hyper::Body>) -> Vec<u8> {
-    let mut body = response.into_body();
-    let mut result = Vec::new();
-    while let Some(bytes) = futures::StreamExt::next(&mut body).await {
-        result.extend_from_slice(bytes.unwrap().as_ref());
-    }
-    result
-}
-
-const MAX_JSON_BODY_PAYLOAD: u64 = 1024 * 16;
-
-pub fn extract_payload<T: DeserializeOwned + Send>()
--> impl Filter<Extract = (T,), Error = Rejection> + Clone {
-    // (rejecting huge payloads)...
-    extract_payload_with_max_size(MAX_JSON_BODY_PAYLOAD)
-}
-
-pub fn extract_payload_with_max_size<T: DeserializeOwned + Send>(
-    max_size: u64,
-) -> impl Filter<Extract = (T,), Error = Rejection> + Clone {
-    warp::body::content_length_limit(max_size).and(warp::body::json())
-}
-
-pub type BoxedRoute = BoxedFilter<(Box<dyn Reply>,)>;
-
-pub fn box_filter<Filter_, Reply_>(filter: Filter_) -> BoxedFilter<(Box<dyn Reply>,)>
-where
-    Filter_: Filter<Extract = (Reply_,), Error = Rejection> + Send + Sync + 'static,
-    Reply_: Reply + Send + 'static,
-{
-    filter.map(|a| Box::new(a) as Box<dyn Reply>).boxed()
-}
-
-/// Sets up basic metrics, cors and proper log tracing for all routes.
-///
-/// # Panics
-///
-/// This method panics if `routes` is empty.
-pub fn finalize_router(
-    routes: Vec<(&'static str, BoxedRoute)>,
-    log_prefix: &'static str,
-) -> impl Filter<Extract = (impl Reply,), Error = Rejection> + Clone {
-    let metrics = ApiMetrics::instance(observe::metrics::get_storage_registry()).unwrap();
-    metrics.reset_requests_rejected();
-    for (method, _) in &routes {
-        metrics.reset_requests_complete(method);
-    }
-
-    let router = routes
-        .into_iter()
-        .fold(
-            Option::<BoxedFilter<(&'static str, Box<dyn Reply>)>>::None,
-            |router, (method, route)| {
-                let route = route.map(move |result| (method, result)).untuple_one();
-                let next = match router {
-                    Some(router) => router.or(route).unify().boxed(),
-                    None => route.boxed(),
-                };
-                Some(next)
-            },
-        )
-        .expect("routes cannot be empty");
-
-    let instrumented =
-        warp::any()
-            .map(Instant::now)
-            .and(router)
-            .map(|timer, method, reply: Box<dyn Reply>| {
-                let response = reply.into_response();
-                metrics.on_request_completed(method, response.status(), timer);
-                response
-            });
-
-    // Final setup
-    let cors = warp::cors()
-        .allow_any_origin()
-        .allow_methods(vec![
-            "GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH", "HEAD",
-        ])
-        .allow_headers(vec!["Origin", "Content-Type", "X-Auth-Token", "X-AppId"]);
-
-    warp::path!("api" / ..)
-        .and(instrumented)
-        .recover(handle_rejection)
-        .with(cors)
-        .with(warp::log::log(log_prefix))
-        .with(warp::trace::trace(make_span))
-}
-
-impl IntoWarpReply for PriceEstimationError {
-    fn into_warp_reply(self) -> WithStatus<Json> {
-        match self {
-            Self::UnsupportedToken { token, reason } => with_status(
+impl IntoResponse for PriceEstimationErrorWrapper {
+    fn into_response(self) -> Response {
+        match self.0 {
+            PriceEstimationError::UnsupportedToken { token, reason } => (
+                StatusCode::BAD_REQUEST,
                 error(
                     "UnsupportedToken",
                     format!("Token {token:?} is unsupported: {reason:}"),
                 ),
+            )
+                .into_response(),
+            PriceEstimationError::UnsupportedOrderType(order_type) => (
                 StatusCode::BAD_REQUEST,
-            ),
-            Self::UnsupportedOrderType(order_type) => with_status(
                 error(
                     "UnsupportedOrderType",
                     format!("{order_type} not supported"),
                 ),
-                StatusCode::BAD_REQUEST,
-            ),
-            Self::NoLiquidity | Self::RateLimited | Self::EstimatorInternal(_) => with_status(
-                error("NoLiquidity", "no route found"),
+            )
+                .into_response(),
+            PriceEstimationError::NoLiquidity
+            | PriceEstimationError::RateLimited
+            | PriceEstimationError::EstimatorInternal(_) => (
                 StatusCode::NOT_FOUND,
-            ),
-            Self::ProtocolInternal(err) => {
+                error("NoLiquidity", "no route found"),
+            )
+                .into_response(),
+            PriceEstimationError::ProtocolInternal(err) => {
                 tracing::error!(?err, "PriceEstimationError::Other");
                 internal_error_reply()
             }
@@ -392,16 +451,55 @@ impl IntoWarpReply for PriceEstimationError {
     }
 }
 
+impl IntoResponse for LoadSolverCompetitionError {
+    fn into_response(self) -> Response {
+        match self {
+            err @ LoadSolverCompetitionError::NotFound => {
+                (StatusCode::NOT_FOUND, error("NotFound", err.to_string())).into_response()
+            }
+            LoadSolverCompetitionError::Other(err) => {
+                tracing::error!(?err, "failed to load solver competition");
+                internal_error_reply()
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub async fn response_body(response: axum::http::Response<axum::body::Body>) -> Vec<u8> {
+    // SAFETY: usize::MAX is ok here because it's a test
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use {super::*, serde::ser, serde_json::json};
+    use {
+        crate::api::{Error, rich_error},
+        alloy::primitives::{Address, B256},
+        app_data::AppDataHash,
+        axum::{
+            Router,
+            body::Body,
+            extract::{Path, Query},
+            http::{Request, StatusCode},
+            response::IntoResponse,
+            routing::get,
+        },
+        model::order::OrderUid,
+        serde::{Deserialize, Serialize, ser},
+        serde_json::json,
+        tower::ServiceExt as _,
+    };
 
     #[test]
     fn rich_errors_skip_unset_data_field() {
         assert_eq!(
             serde_json::to_value(&Error {
-                error_type: "foo",
-                description: "bar",
+                error_type: "foo".into(),
+                description: "bar".into(),
                 data: None,
             })
             .unwrap(),
@@ -412,8 +510,8 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(Error {
-                error_type: "foo",
-                description: "bar",
+                error_type: "foo".into(),
+                description: "bar".into(),
                 data: Some(json!(42)),
             })
             .unwrap(),
@@ -437,20 +535,384 @@ mod tests {
             }
         }
 
-        let body = warp::hyper::body::to_bytes(
-            rich_error("foo", "bar", AlwaysErrors)
-                .into_response()
-                .into_body(),
-        )
-        .await
-        .unwrap();
+        let response = rich_error("foo", "bar", AlwaysErrors).into_response();
+        // SAFETY: usize::MAX is ok here because it's a test
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
 
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             json!({
                 "errorType": "foo",
                 "description": "bar",
             })
         );
+    }
+
+    // Tests for Axum extractor type parsing.
+    //
+    // Since the parsing behavior depends on the type, not the endpoint,
+    // we test each type once here rather than duplicating across handlers.
+
+    async fn get_request(router: Router, path: &str) -> axum::response::Response<Body> {
+        router
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    mod path_order_uid {
+        use super::*;
+
+        async fn handler(Path(_uid): Path<OrderUid>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/orders/{uid}", get(handler))
+        }
+
+        async fn request(uid: &str) -> axum::response::Response<Body> {
+            get_request(router(), &format!("/orders/{uid}")).await
+        }
+
+        #[tokio::test]
+        async fn with_0x_prefix() {
+            let uid = format!("0x{}", "01".repeat(56));
+            assert_eq!(request(&uid).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn without_0x_prefix() {
+            let uid = "01".repeat(56);
+            assert_eq!(request(&uid).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_with_0x() {
+            let uid = format!("0x{}", "01".repeat(56).strip_suffix('1').unwrap());
+            assert_eq!(request(&uid).await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_without_0x() {
+            let uid = "01".repeat(56);
+            let uid = uid.strip_suffix('1').unwrap();
+            assert_eq!(request(uid).await.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    mod path_address {
+        use super::*;
+
+        async fn handler(Path(_addr): Path<Address>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/token/{addr}", get(handler))
+        }
+
+        async fn request(addr: &str) -> axum::response::Response<Body> {
+            get_request(router(), &format!("/token/{addr}")).await
+        }
+
+        #[tokio::test]
+        async fn with_0x_prefix() {
+            let addr = format!("0x{}", "01".repeat(20));
+            assert_eq!(request(&addr).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn without_0x_prefix() {
+            let addr = "01".repeat(20);
+            assert_eq!(request(&addr).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_with_0x() {
+            let addr = format!("0x{}", "01".repeat(20).strip_suffix('1').unwrap());
+            assert_eq!(request(&addr).await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_without_0x() {
+            let addr = "01".repeat(20);
+            let addr = addr.strip_suffix('1').unwrap();
+            assert_eq!(request(addr).await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn too_short() {
+            assert_eq!(request("0x0101").await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn invalid_hex_chars() {
+            let addr = format!("0x{}", "GG".repeat(20));
+            assert_eq!(request(&addr).await.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    mod path_b256 {
+        use super::*;
+
+        async fn handler(Path(_hash): Path<B256>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/tx/{hash}", get(handler))
+        }
+
+        async fn request(hash: &str) -> axum::response::Response<Body> {
+            get_request(router(), &format!("/tx/{hash}")).await
+        }
+
+        #[tokio::test]
+        async fn with_0x_prefix() {
+            let hash = format!("0x{}", "01".repeat(32));
+            assert_eq!(request(&hash).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn without_0x_prefix() {
+            let hash = "01".repeat(32);
+            assert_eq!(request(&hash).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_with_0x() {
+            let hash = format!("0x{}", "01".repeat(32).strip_suffix('1').unwrap());
+            assert_eq!(request(&hash).await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_without_0x() {
+            let hash = "01".repeat(32);
+            let hash = hash.strip_suffix('1').unwrap();
+            assert_eq!(request(hash).await.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    mod path_app_data_hash {
+        use super::*;
+
+        async fn handler(Path(_hash): Path<AppDataHash>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/app_data/{hash}", get(handler))
+        }
+
+        async fn request(hash: &str) -> axum::response::Response<Body> {
+            get_request(router(), &format!("/app_data/{hash}")).await
+        }
+
+        #[tokio::test]
+        async fn with_0x_prefix() {
+            let hash = format!("0x{}", "01".repeat(32));
+            assert_eq!(request(&hash).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn without_0x_prefix() {
+            let hash = "01".repeat(32);
+            assert_eq!(request(&hash).await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_with_0x() {
+            let hash = format!("0x{}", "01".repeat(32).strip_suffix('1').unwrap());
+            assert_eq!(request(&hash).await.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn odd_hex_chars_without_0x() {
+            let hash = "01".repeat(32);
+            let hash = hash.strip_suffix('1').unwrap();
+            assert_eq!(request(hash).await.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    mod path_u64 {
+        use super::*;
+
+        async fn handler(Path(_id): Path<u64>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/resource/{id}", get(handler))
+        }
+
+        async fn request(path: &str) -> axum::response::Response<Body> {
+            get_request(router(), path).await
+        }
+
+        #[tokio::test]
+        async fn valid() {
+            assert_eq!(request("/resource/123").await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn invalid_string() {
+            assert_eq!(
+                request("/resource/abc").await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn negative() {
+            assert_eq!(
+                request("/resource/-1").await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    mod query_hex_types {
+        use super::*;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Params {
+            #[allow(unused)]
+            order_uid: Option<OrderUid>,
+            #[allow(unused)]
+            owner: Option<Address>,
+        }
+
+        async fn handler(Query(_q): Query<Params>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/trades", get(handler))
+        }
+
+        async fn request(query: &str) -> axum::response::Response<Body> {
+            get_request(router(), &format!("/trades?{query}")).await
+        }
+
+        #[tokio::test]
+        async fn order_uid_with_0x_prefix() {
+            let uid = format!("0x{}", "01".repeat(56));
+            assert_eq!(
+                request(&format!("orderUid={uid}")).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn order_uid_without_0x_prefix() {
+            let uid = "01".repeat(56);
+            assert_eq!(
+                request(&format!("orderUid={uid}")).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn order_uid_odd_hex_chars() {
+            let uid = format!("0x{}", "01".repeat(56).strip_suffix('1').unwrap());
+            assert_eq!(
+                request(&format!("orderUid={uid}")).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn owner_with_0x_prefix() {
+            let owner = format!("0x{}", "01".repeat(20));
+            assert_eq!(
+                request(&format!("owner={owner}")).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn owner_without_0x_prefix() {
+            let owner = "01".repeat(20);
+            assert_eq!(
+                request(&format!("owner={owner}")).await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn owner_odd_hex_chars() {
+            let owner = format!("0x{}", "01".repeat(20).strip_suffix('1').unwrap());
+            assert_eq!(
+                request(&format!("owner={owner}")).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    mod query_numeric_types {
+        use super::*;
+
+        #[derive(Deserialize)]
+        struct Params {
+            #[allow(unused)]
+            offset: Option<u64>,
+            #[allow(unused)]
+            limit: Option<u64>,
+        }
+
+        async fn handler(Query(_q): Query<Params>) -> StatusCode {
+            StatusCode::OK
+        }
+
+        fn router() -> Router {
+            Router::new().route("/items", get(handler))
+        }
+
+        async fn request(path: &str) -> axum::response::Response<Body> {
+            get_request(router(), path).await
+        }
+
+        #[tokio::test]
+        async fn no_params() {
+            assert_eq!(request("/items").await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn only_offset() {
+            assert_eq!(request("/items?offset=5").await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn only_limit() {
+            assert_eq!(request("/items?limit=20").await.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn both_params() {
+            assert_eq!(
+                request("/items?offset=5&limit=20").await.status(),
+                StatusCode::OK
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_offset() {
+            assert_eq!(
+                request("/items?offset=abc").await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_limit() {
+            assert_eq!(
+                request("/items?limit=abc").await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 }
