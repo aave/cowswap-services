@@ -533,6 +533,7 @@ fn orders_with_balance<'a>(
     settlement_contract: Address,
     filter_bypass_orders: &HashSet<OrderUid>,
 ) -> (Vec<&'a Order>, Vec<OrderUid>) {
+    tracing::debug!(?balances, "filtering orders based on balance");
     // Prefer newer orders over older ones.
     orders.sort_by_key(|order| std::cmp::Reverse(order.metadata.creation_date));
     let mut filtered_orders = vec![];
@@ -568,6 +569,7 @@ fn orders_with_balance<'a>(
             None => return false,
             Some(balance) => balance,
         };
+        tracing::debug!(%balance, %needed_balance);
         balance >= needed_balance
     };
 
