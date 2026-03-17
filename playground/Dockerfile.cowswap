@@ -10,13 +10,14 @@ RUN corepack enable \
 ARG REACT_APP_NETWORK_URL_1=https://rpc.mevblocker.io
 ARG REACT_APP_NETWORK_URL_5=https://ethereum-goerli.publicnode.com
 ARG REACT_APP_NETWORK_URL_100=https://gnosis.publicnode.com
+ARG REACT_APP_NETWORK_URL_123456789=http://127.0.0.1:8080
 ARG REACT_APP_EXPLORER_URL_DEV=http://localhost:8001
 
 # Block explorer URL (Otterscan for local development)
 ARG REACT_APP_BLOCK_EXPLORER_URL=http://localhost:8003
 
 # Orderbook URL args
-ARG REACT_APP_ORDER_BOOK_URLS='{"1":"https://api.cow.fi/mainnet","100":"https://api.cow.fi/goerli","5":"https://api.cow.fi/xdai"}'
+ARG REACT_APP_ORDER_BOOK_URLS='{"123456789": "http://127.0.0.1:8080"}'
 
 # Install system dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && \
@@ -25,6 +26,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && \
 
 # Clone the repo, initialize submodules, and install dependencies
 RUN git clone https://github.com/cowprotocol/cowswap . \
+    && git checkout 3c449d35952bb90cc5d26d8717e7f5da0c1a7f0d \
     && git submodule update --init --recursive \
     && pnpm install --frozen-lockfile
 
@@ -40,6 +42,7 @@ ENV ETH_RPC_URL="$ETH_RPC_URL"
 ENV REACT_APP_NETWORK_URL_1="$REACT_APP_NETWORK_URL_1"
 ENV REACT_APP_NETWORK_URL_5="$REACT_APP_NETWORK_URL_5"
 ENV REACT_APP_NETWORK_URL_100="$REACT_APP_NETWORK_URL_100"
+ENV REACT_APP_NETWORK_URL_123456789="$REACT_APP_NETWORK_URL_123456789"
 ENV REACT_APP_ORDER_BOOK_URLS="$REACT_APP_ORDER_BOOK_URLS"
 ENV REACT_APP_EXPLORER_URL_DEV="$REACT_APP_EXPLORER_URL_DEV"
 ENV REACT_APP_BLOCK_EXPLORER_URL="$REACT_APP_BLOCK_EXPLORER_URL"
@@ -48,6 +51,10 @@ ENV REACT_APP_BLOCK_EXPLORER_URL="$REACT_APP_BLOCK_EXPLORER_URL"
 RUN set -e; \
     if [ -n "$ETH_RPC_URL" ]; then \
         case "$CHAIN" in \
+            123456789) \
+                REACT_APP_NETWORK_URL_123456789="$ETH_RPC_URL"; \
+                REACT_APP_ORDER_BOOK_URLS=$(echo "$REACT_APP_ORDER_BOOK_URLS" | jq --arg chain "123456789" '.[$chain]="http://127.0.0.1:8080"'); \
+                ;; \
             1) \
                 REACT_APP_NETWORK_URL_1="$ETH_RPC_URL"; \
                 REACT_APP_ORDER_BOOK_URLS=$(echo "$REACT_APP_ORDER_BOOK_URLS" | jq --arg chain "1" '.[$chain]="http://127.0.0.1:8080"'); \
@@ -62,11 +69,12 @@ RUN set -e; \
                 ;; \
         esac; \
     fi; \
-    export REACT_APP_NETWORK_URL_1 REACT_APP_NETWORK_URL_5 REACT_APP_NETWORK_URL_100 REACT_APP_ORDER_BOOK_URLS REACT_APP_EXPLORER_URL_DEV REACT_APP_BLOCK_EXPLORER_URL; \
+    export REACT_APP_NETWORK_URL_1 REACT_APP_NETWORK_URL_5 REACT_APP_NETWORK_URL_100 REACT_APP_NETWORK_URL_123456789 REACT_APP_ORDER_BOOK_URLS REACT_APP_EXPLORER_URL_DEV REACT_APP_BLOCK_EXPLORER_URL; \
     NODE_OPTIONS="--max-old-space-size=4096" NX_NO_CLOUD=true pnpm run build \
         --env REACT_APP_NETWORK_URL_1="$REACT_APP_NETWORK_URL_1" \
         --env REACT_APP_NETWORK_URL_5="$REACT_APP_NETWORK_URL_5" \
         --env REACT_APP_NETWORK_URL_100="$REACT_APP_NETWORK_URL_100" \
+        --env REACT_APP_NETWORK_URL_123456789="$REACT_APP_NETWORK_URL_123456789" \
         --env REACT_APP_ORDER_BOOK_URLS="$REACT_APP_ORDER_BOOK_URLS" \
         --env REACT_APP_EXPLORER_URL_DEV="$REACT_APP_EXPLORER_URL_DEV" \
         --env REACT_APP_BLOCK_EXPLORER_URL="$REACT_APP_BLOCK_EXPLORER_URL"
