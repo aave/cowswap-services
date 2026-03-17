@@ -88,7 +88,7 @@ await window.ethereum.request({
   method: 'wallet_addEthereumChain',
   params: [
     {
-      chainId: '0x1',
+      chainId: '0x75BCD15',
       chainName: 'Local Network (Mainnet)',
       rpcUrls: ['http://localhost:8545'],
       nativeCurrency: {
