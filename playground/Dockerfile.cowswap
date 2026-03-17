@@ -17,7 +17,7 @@ ARG REACT_APP_EXPLORER_URL_DEV=http://localhost:8001
 ARG REACT_APP_BLOCK_EXPLORER_URL=http://localhost:8003
 
 # Orderbook URL args
-ARG REACT_APP_ORDER_BOOK_URLS='{"123456789": "http://127.0.0.1:8080"}'
+ARG REACT_APP_ORDER_BOOK_URLS='{"1": "http://127.0.0.1:8080", "123456789": "http://127.0.0.1:8080"}'
 
 # Install system dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && \
