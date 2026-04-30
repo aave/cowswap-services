@@ -278,7 +278,6 @@ impl Ranking {
 mod tests {
     use {
         crate::{
-            config::solver::Account,
             domain::{
                 Auction,
                 Order,

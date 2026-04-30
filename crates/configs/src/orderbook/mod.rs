@@ -409,6 +409,7 @@ mod tests {
             http_client: Default::default(),
             price_estimation: Default::default(),
             order_simulation: Default::default(),
+            skip_domain_separator_verification: Default::default(),
         };
 
         let serialized = toml::to_string_pretty(&config).unwrap();
