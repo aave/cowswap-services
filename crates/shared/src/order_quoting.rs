@@ -149,7 +149,7 @@ impl Quote {
         self.buy_amount = U256::uint_try_from(
             self.data
                 .quoted_buy_amount
-                .widening_mul::<256, 4, 512, 8>(sell_amount)
+                .widening_mul::<_, _, 512, 8>(sell_amount)
                 / U512::from(self.data.quoted_sell_amount),
         )
         .unwrap_or(U256::MAX);
@@ -496,8 +496,9 @@ impl OrderQuoter {
                 buy_amount_after_fee: buy_amount,
             } => (trade_estimate.out_amount, buy_amount.get()),
         };
+
         let fee_parameters = FeeParameters {
-            gas_amount: trade_estimate.gas as _,
+            gas_amount: trade_estimate.gas as f64,
             gas_price: effective_gas_price as f64,
             sell_token_price,
         };

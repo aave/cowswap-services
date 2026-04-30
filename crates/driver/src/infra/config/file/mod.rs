@@ -1,14 +1,15 @@
 pub use load::load;
 use {
-    crate::{domain::eth, infra},
+    crate::infra,
     alloy::{eips::BlockNumberOrTag, primitives::Address},
-    gas_price_estimation::configurable_alloy::{default_past_blocks, default_reward_percentile},
+    configs::gas_price_estimation::{default_past_blocks, default_reward_percentile},
+    eth_domain_types as eth,
     number::serialization::HexOrDecimalU256,
     reqwest::Url,
     serde::{Deserialize, Deserializer, Serialize},
     serde_with::serde_as,
     solver::solver::Arn,
-    std::{collections::HashMap, time::Duration},
+    std::{collections::HashMap, num::NonZeroUsize, time::Duration},
 };
 
 mod load;
@@ -46,12 +47,6 @@ struct Config {
     #[serde(default)]
     contracts: ContractsConfig,
 
-    /// Use Tenderly for transaction simulation.
-    tenderly: Option<TenderlyConfig>,
-
-    /// Use Enso for transaction simulation.
-    enso: Option<EnsoConfig>,
-
     /// Liquidity sources notifier configuration.
     liquidity_sources_notifier: Option<LiquiditySourcesNotifier>,
 
@@ -87,6 +82,13 @@ struct Config {
 
     #[serde_as(as = "HexOrDecimalU256")]
     tx_gas_limit: eth::U256,
+
+    #[serde(default)]
+    simulator: configs::simulator::Config,
+
+    /// Http client factory config
+    #[serde(default)]
+    http: configs::http_client::HttpClient,
 }
 
 #[serde_as]
@@ -232,6 +234,10 @@ pub fn default_solving_share_of_deadline() -> f64 {
     0.8
 }
 
+fn default_max_solutions_to_propose() -> NonZeroUsize {
+    NonZeroUsize::new(1).unwrap()
+}
+
 #[serde_as]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -320,6 +326,13 @@ struct SolverConfig {
     /// Address of the deployed CowSettlementForwarder contract for EIP-7702
     /// delegation. Required when `submission_accounts` is non-empty.
     forwarder_contract: Option<eth::Address>,
+
+    /// Maximum number of solutions the driver proposes to the autopilot per
+    /// auction. Defaults to 1 (only the best-scoring solution). Values > 1
+    /// require `submission-accounts` to be configured; the driver will refuse
+    /// to start otherwise.
+    #[serde(default = "default_max_solutions_to_propose")]
+    max_solutions_to_propose: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -419,40 +432,6 @@ pub struct CowAmmConfig {
     pub factory: eth::Address,
     /// Which helper contract to use for interfacing with CoW AMMs.
     pub helper: eth::Address,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct TenderlyConfig {
-    /// Optionally override the Tenderly API URL.
-    url: Option<Url>,
-
-    /// Authentication key for the Tenderly API.
-    api_key: String,
-
-    /// The Tenderly user associated with the API key.
-    user: String,
-
-    /// The Tenderly project associated with the API key.
-    project: String,
-
-    /// Save the transaction on Tenderly for later inspection, e.g. via the
-    /// dashboard.
-    save: bool,
-
-    /// Save the transaction even in the case of failure.
-    save_if_fails: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-struct EnsoConfig {
-    /// URL at which the trade simulator is hosted
-    url: Url,
-    /// How often the network produces a new block. If this is not set the
-    /// system assumes an unpredictable network like proof-of-work.
-    #[serde(default, with = "humantime_serde")]
-    network_block_interval: Option<Duration>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
