@@ -56,10 +56,6 @@ fmt *extra:
     cargo +nightly fmt --all -- {{extra}}
     cd contracts && cargo +nightly fmt --all -- {{extra}}
 
-# Format .toml files in the repository
-fmt-toml *extra:
-    tombi format {{extra}}
-
 
 # Format .toml files in the repository
 fmt-toml *extra:
