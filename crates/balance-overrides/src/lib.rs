@@ -1,169 +1,29 @@
+mod aave;
 pub mod detector;
 
 use {
-    self::detector::{DetectionError, Detector},
+    self::{
+        aave::mapping_slot_hash,
+        detector::{DetectionError, Detector},
+    },
     alloy_primitives::{Address, B256, U256, keccak256, map::AddressMap},
     alloy_rpc_types::state::AccountOverride,
-    anyhow::Context as _,
     cached::{Cached, SizedCache},
-    std::{
-        collections::HashMap,
-        fmt::{self, Display, Formatter},
-        iter,
-        str::FromStr,
-        sync::{Arc, Mutex},
-    },
+    configs::balance_overrides::Strategy,
+    ethrpc::Web3,
+    std::{collections::HashMap, iter, sync::Mutex},
 };
-
-/// Balance override configuration arguments.
-#[derive(clap::Parser)]
-#[group(skip)]
-pub struct Arguments {
-    /// Token configuration for simulated balances on verified quotes. This
-    /// allows the quote verification system to produce verified quotes for
-    /// traders without sufficient balance for the configured token pairs.
-    ///
-    /// The expected format is a comma separated list of `${ADDR}@${SLOT}`,
-    /// where `ADDR` is the token address and `SLOT` is the Solidity storage
-    /// slot for the balances mapping. For example for WETH:
-    /// `0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2@3`.
-    #[clap(long, env, default_value_t)]
-    pub quote_token_balance_overrides: TokenConfiguration,
-
-    /// Enable automatic detection of token balance overrides. Note that
-    /// pre-configured values with the `--quote-token-balance-overrides` flag
-    /// will take precedence.
-    #[clap(long, env, action = clap::ArgAction::Set, default_value_t)]
-    pub quote_autodetect_token_balance_overrides: bool,
-
-    /// Controls how many storage slots get probed per storage entry point
-    /// for automatically detecting how to override the balances of a token.
-    #[clap(long, env, action = clap::ArgAction::Set, default_value = "60")]
-    pub quote_autodetect_token_balance_overrides_probing_depth: u8,
-
-    /// Controls for how many tokens we store the result of the automatic
-    /// balance override detection before evicting less used entries.
-    #[clap(long, env, action = clap::ArgAction::Set, default_value = "1000")]
-    pub quote_autodetect_token_balance_overrides_cache_size: usize,
-}
-
-impl Arguments {
-    /// Creates a balance overrides instance from the current configuration.
-    pub fn init(&self, web3: ethrpc::Web3) -> Arc<dyn BalanceOverriding> {
-        Arc::new(BalanceOverrides {
-            hardcoded: self.quote_token_balance_overrides.0.clone(),
-            detector: self.quote_autodetect_token_balance_overrides.then(|| {
-                (
-                    Detector::new(
-                        web3,
-                        self.quote_autodetect_token_balance_overrides_probing_depth,
-                    ),
-                    Mutex::new(SizedCache::with_size(
-                        self.quote_autodetect_token_balance_overrides_cache_size,
-                    )),
-                )
-            }),
-        })
-    }
-}
-
-impl Display for Arguments {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let Self {
-            quote_token_balance_overrides,
-            quote_autodetect_token_balance_overrides,
-            quote_autodetect_token_balance_overrides_probing_depth,
-            quote_autodetect_token_balance_overrides_cache_size,
-        } = self;
-
-        writeln!(
-            f,
-            "quote_token_balance_overrides: {quote_token_balance_overrides:?}"
-        )?;
-        writeln!(
-            f,
-            "quote_autodetect_token_balance_overrides: \
-             {quote_autodetect_token_balance_overrides:?}"
-        )?;
-        writeln!(
-            f,
-            "quote_autodetect_token_balance_overrides_probing_depth: \
-             {quote_autodetect_token_balance_overrides_probing_depth:?}"
-        )?;
-        writeln!(
-            f,
-            "quote_autodetect_token_balance_overrides_cache_size: \
-             {quote_autodetect_token_balance_overrides_cache_size:?}"
-        )?;
-
-        Ok(())
-    }
-}
-
 /// Token configurations for the `BalanceOverriding` component.
 #[derive(Clone, Debug, Default)]
 pub struct TokenConfiguration(HashMap<Address, Strategy>);
 
-impl Display for TokenConfiguration {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        let format_entry =
-            |f: &mut Formatter, (addr, strategy): (&Address, &Strategy)| match strategy {
-                Strategy::SolidityMapping {
-                    target_contract,
-                    map_slot,
-                } => write!(
-                    f,
-                    "SolidityMapping({addr:?}: {target_contract:?}@{map_slot})"
-                ),
-                Strategy::SoladyMapping { target_contract } => {
-                    write!(f, "SoladyMapping({addr:?}: {target_contract})")
-                }
-                Strategy::DirectSlot {
-                    target_contract,
-                    slot,
-                } => write!(f, "DirectSlot({addr:?}: {target_contract:?}@{slot})"),
-            };
-
-        let mut entries = self.0.iter();
-
-        let Some(first) = entries.next() else {
-            return Ok(());
-        };
-        format_entry(f, first)?;
-
-        for entry in entries {
-            f.write_str(",")?;
-            format_entry(f, entry)?;
-        }
-
-        Ok(())
+impl TokenConfiguration {
+    pub fn new(configuration: HashMap<Address, Strategy>) -> Self {
+        Self(configuration)
     }
-}
 
-impl FromStr for TokenConfiguration {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.is_empty() {
-            return Ok(Self::default());
-        }
-
-        let entries = s
-            .split(',')
-            .map(|part| -> Result<_, Self::Err> {
-                let (addr, slot) = part
-                    .split_once('@')
-                    .context("expected {addr}@{slot} format")?;
-                Ok((
-                    addr.parse()?,
-                    Strategy::SolidityMapping {
-                        target_contract: addr.parse()?,
-                        map_slot: slot.parse()?,
-                    },
-                ))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(Self(entries))
+    pub fn into_inner(self) -> HashMap<Address, Strategy> {
+        self.0
     }
 }
 
@@ -190,59 +50,74 @@ pub struct BalanceOverrideRequest {
     pub amount: U256,
 }
 
-/// Balance override strategy for a token.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Strategy {
-    /// Balance override strategy for tokens whose balances are stored in a
-    /// direct Solidity mapping from token holder to balance amount in the
-    /// form `mapping(address holder => uint256 amount)`.
-    ///
-    /// The strategy is configured with the storage slot [^1] of the mapping.
-    ///
-    /// [^1]: <https://docs.soliditylang.org/en/latest/internals/layout_in_storage.html#mappings-and-dynamic-arrays>
-    SolidityMapping {
-        target_contract: Address,
-        map_slot: U256,
-    },
-    /// Strategy computing storage slot for balances based on the Solady library
-    /// [^1].
-    ///
-    /// [^1]: <https://github.com/Vectorized/solady/blob/6122858a3aed96ee9493b99f70a245237681a95f/src/tokens/ERC20.sol#L75-L81>
-    SoladyMapping { target_contract: Address },
-    /// Strategy that directly uses the storage slot discovered via
-    /// debug_traceCall. This is similar to Foundry's `deal` approach where
-    /// we trace a balanceOf call to find which storage slot is accessed for
-    /// a given account.
-    DirectSlot {
-        target_contract: Address,
-        slot: B256,
-    },
+#[async_trait::async_trait]
+trait StrategyExt {
+    /// Computes the storage slot and value to override for a particular token
+    /// holder and amount. `web3` is only consulted by strategies that need
+    /// on-chain reads at override time (currently `AaveV3AToken`); other
+    /// variants ignore it and complete synchronously.
+    async fn state_override(
+        &self,
+        web3: Option<&Web3>,
+        holder: &Address,
+        amount: &U256,
+    ) -> AddressMap<AccountOverride>;
+
+    fn is_valid_for_all_holders(&self) -> bool;
 }
 
-impl Strategy {
-    /// Computes the storage slot and value to override for a particular token
-    /// holder and amount.
-    fn state_override(&self, holder: &Address, amount: &U256) -> AddressMap<AccountOverride> {
+#[async_trait::async_trait]
+impl StrategyExt for Strategy {
+    async fn state_override(
+        &self,
+        web3: Option<&Web3>,
+        holder: &Address,
+        amount: &U256,
+    ) -> AddressMap<AccountOverride> {
         let (target_contract, key) = match self {
             Self::SolidityMapping {
                 target_contract,
                 map_slot,
-            } => {
-                let mut buf = [0; 64];
-                buf[12..32].copy_from_slice(holder.as_slice());
-                buf[32..64].copy_from_slice(&map_slot.to_be_bytes::<32>());
-                (target_contract, keccak256(buf))
-            }
+            } => (
+                *target_contract,
+                mapping_slot_hash(holder, &map_slot.to_be_bytes()),
+            ),
             Self::SoladyMapping { target_contract } => {
                 let mut buf = [0; 32];
                 buf[0..20].copy_from_slice(holder.as_slice());
                 buf[28..32].copy_from_slice(&[0x87, 0xa2, 0x11, 0xa2]);
-                (target_contract, keccak256(buf))
+                (*target_contract, keccak256(buf))
             }
             Self::DirectSlot {
                 target_contract,
                 slot,
-            } => (target_contract, *slot),
+            } => (*target_contract, *slot),
+            Self::AaveV3AToken {
+                target_contract,
+                pool,
+                underlying,
+            } => {
+                let Some(web3) = web3 else {
+                    tracing::warn!(
+                        ?target_contract,
+                        "AaveV3AToken balance override requested but web3 is not configured",
+                    );
+                    return AddressMap::default();
+                };
+                return match aave::build_override(
+                    web3,
+                    *target_contract,
+                    *pool,
+                    *underlying,
+                    *holder,
+                    *amount,
+                )
+                .await
+                {
+                    Some((addr, override_)) => iter::once((addr, override_)).collect(),
+                    None => AddressMap::default(),
+                };
+            }
         };
 
         let state_override = AccountOverride {
@@ -250,11 +125,15 @@ impl Strategy {
             ..Default::default()
         };
 
-        iter::once((*target_contract, state_override)).collect()
+        iter::once((target_contract, state_override)).collect()
     }
 
     fn is_valid_for_all_holders(&self) -> bool {
-        matches!(self, Self::DirectSlot { .. })
+        // `AaveV3AToken` fields (target, pool, underlying) are all token-level
+        // constants; the slot and value are derived per-holder at override
+        // time. Caching the strategy once per token avoids re-running the
+        // probe for every new `from` address.
+        matches!(self, Self::DirectSlot { .. } | Self::AaveV3AToken { .. })
     }
 }
 
@@ -270,8 +149,17 @@ pub struct BalanceOverrides {
     /// the caching policy.
     pub hardcoded: HashMap<Address, Strategy>,
     /// The balance override detector and its cache. Set to `None` if
-    /// auto-detection is not enabled.
+    /// auto-detection is disabled. The detector internally holds its own
+    /// `Web3` handle for tracing and verification calls.
     pub detector: Option<(Detector, DetectorCache)>,
+    /// `Web3` handle used by strategies that need on-chain reads at
+    /// override-resolution time (currently only `AaveV3AToken`, which
+    /// fetches the live liquidity index from the Aave pool). Kept separate
+    /// from the detector's own web3 so that hardcoded `AaveV3AToken`
+    /// entries still resolve when auto-detection is disabled. Both handles
+    /// typically point at the same underlying `Web3` instance; `Web3` is
+    /// cheaply cloneable, so the double-reference is just two `Arc` bumps.
+    pub web3: Option<Web3>,
 }
 
 impl BalanceOverrides {
@@ -280,9 +168,10 @@ impl BalanceOverrides {
         Self {
             hardcoded: Default::default(),
             detector: Some((
-                Detector::new(web3, 60),
+                Detector::new(web3.clone(), 60, detector::DEFAULT_VERIFICATION_TIMEOUT),
                 Mutex::new(SizedCache::with_size(1000)),
             )),
+            web3: Some(web3),
         }
     }
 
@@ -352,7 +241,8 @@ impl BalanceOverriding for BalanceOverrides {
         }?;
 
         strategy
-            .state_override(&request.holder, &request.amount)
+            .state_override(self.web3.as_ref(), &request.holder, &request.amount)
+            .await
             .into_iter()
             .last()
     }
@@ -376,6 +266,7 @@ impl BalanceOverriding for DummyOverrider {
 mod tests {
     use {
         super::*,
+        crate::aave::{pack_user_state, ray_div},
         alloy_primitives::{address, b256},
         ethrpc::mock,
         maplit::hashmap,
@@ -540,9 +431,14 @@ mod tests {
         let balance_overrides = BalanceOverrides {
             hardcoded: Default::default(),
             detector: Some((
-                Detector::new(mock_web3, 60),
+                Detector::new(
+                    mock_web3.clone(),
+                    60,
+                    detector::DEFAULT_VERIFICATION_TIMEOUT,
+                ),
                 Mutex::new(SizedCache::with_size(100)),
             )),
+            web3: Some(mock_web3),
         };
 
         // Manually populate the cache as if detector found this holder-agnostic
@@ -588,9 +484,14 @@ mod tests {
         let balance_overrides = BalanceOverrides {
             hardcoded: Default::default(),
             detector: Some((
-                Detector::new(mock_web3, 60),
+                Detector::new(
+                    mock_web3.clone(),
+                    60,
+                    detector::DEFAULT_VERIFICATION_TIMEOUT,
+                ),
                 Mutex::new(SizedCache::with_size(100)),
             )),
+            web3: Some(mock_web3),
         };
 
         // Manually populate cache with holder-specific strategies
@@ -615,5 +516,133 @@ mod tests {
             balance_overrides.cached_detection(token, holder2).await,
             Some(strategy_h2)
         );
+    }
+
+    #[test]
+    fn ray_div_edge_cases() {
+        let index = U256::from_str_radix("1063000000000000000000000000", 10).unwrap();
+        // 0 / x = 0.
+        assert_eq!(ray_div(U256::ZERO, index).unwrap(), U256::ZERO);
+        // Divide by zero returns None.
+        assert_eq!(
+            ray_div(U256::from(1_000_000_000_000_000_000u128), U256::ZERO),
+            None,
+        );
+    }
+
+    #[test]
+    fn pack_user_state_leaves_additional_data_intact() {
+        let balance = U256::from(0x1234_5678u64);
+        let extra = U256::from(0xabcd_ef01u64);
+        let packed = pack_user_state(balance, extra);
+        let word = U256::from_be_bytes(packed.0);
+
+        let mask = (U256::from(1u64) << 128) - U256::from(1u64);
+        assert_eq!(word & mask, balance);
+        assert_eq!(word >> 128, extra);
+    }
+
+    #[test]
+    fn pack_user_state_truncates_to_uint128() {
+        // A value larger than uint128 should be masked down to its low 128
+        // bits. Using 2^128 + 7 so we can check the wrap visibly.
+        let overflow = (U256::from(1u64) << 128) + U256::from(7u64);
+        let packed = pack_user_state(overflow, U256::ZERO);
+        let word = U256::from_be_bytes(packed.0);
+        assert_eq!(word, U256::from(7u64));
+    }
+
+    #[test]
+    fn mapping_slot_hash_matches_solidity_layout() {
+        // keccak256(pad32(holder) || map_slot) — verified with
+        // `cast keccak $(cast abi-encode "f(address,uint256)" $HOLDER 52)`.
+        let holder = address!("18709E89BD403F470088aBDAcEbE86CC60dda12e");
+        let slot = mapping_slot_hash(&holder, &U256::from(52).to_be_bytes::<32>());
+        assert_eq!(
+            slot,
+            b256!("6785743a4ad9de6e692f819936c9d0b94b199ed36f2660e82404737b769718e5")
+        );
+    }
+
+    #[tokio::test]
+    async fn aave_v3_a_token_override_scales_amount_and_writes_low_128() {
+        use alloy_provider::mock::Asserter;
+
+        // aEthWETH mainnet triple.
+        let a_token = address!("4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8");
+        let pool = address!("87870bca3f3fd6335c3f4ce8392d69350b4fa4e2");
+        let underlying = address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let holder = address!("18709E89BD403F470088aBDAcEbE86CC60dda12e");
+        let amount = U256::from(1_000_000_000_000_000_000u128); // 1 aEthWETH
+
+        let asserter = Asserter::new();
+        // The mock responds to our `eth_call` with the encoded `uint256`
+        // normalized income — a ray value just above 1.063.
+        let index = U256::from_str_radix("1063000000000000000000000000", 10).unwrap();
+        asserter.push_success(&format!("0x{:064x}", index));
+
+        let balance_overrides = BalanceOverrides {
+            hardcoded: hashmap! {
+                a_token => Strategy::AaveV3AToken {
+                    target_contract: a_token,
+                    pool,
+                    underlying,
+                },
+            },
+            detector: None,
+            web3: Some(Web3::with_asserter(asserter)),
+        };
+
+        let (addr, override_) = balance_overrides
+            .state_override(BalanceOverrideRequest {
+                token: a_token,
+                holder,
+                amount,
+            })
+            .await
+            .expect("override computed");
+
+        assert_eq!(addr, a_token);
+
+        let diff = override_.state_diff.expect("state diff present");
+        assert_eq!(diff.len(), 1);
+        let (slot, value) = diff.into_iter().next().unwrap();
+        // Slot is keccak256(holder || 52) — same one used by aEthWETH.
+        assert_eq!(
+            slot,
+            b256!("6785743a4ad9de6e692f819936c9d0b94b199ed36f2660e82404737b769718e5")
+        );
+        // Scaled balance in low 128, zero in high 128 (safe for fresh
+        // holders like the spardose).
+        let word = U256::from_be_bytes(value.0);
+        assert_eq!(word >> 128, U256::ZERO);
+        assert_eq!(word, ray_div(amount, index).unwrap());
+    }
+
+    /// When no detector is configured, there's no `Web3` handle available
+    /// and the `AaveV3AToken` resolver must cleanly fail rather than panic.
+    #[tokio::test]
+    async fn aave_v3_a_token_override_none_without_web3() {
+        let a_token = address!("4d5F47FA6A74757f35C14fD3a6Ef8E3C9BC514E8");
+        let balance_overrides = BalanceOverrides {
+            hardcoded: hashmap! {
+                a_token => Strategy::AaveV3AToken {
+                    target_contract: a_token,
+                    pool: address!("87870bca3f3fd6335c3f4ce8392d69350b4fa4e2"),
+                    underlying: address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+                },
+            },
+            detector: None,
+            web3: None,
+        };
+
+        let result = balance_overrides
+            .state_override(BalanceOverrideRequest {
+                token: a_token,
+                holder: address!("18709E89BD403F470088aBDAcEbE86CC60dda12e"),
+                amount: U256::from(1u64),
+            })
+            .await;
+        assert!(result.is_none());
     }
 }
