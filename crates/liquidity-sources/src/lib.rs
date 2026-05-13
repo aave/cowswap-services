@@ -57,6 +57,7 @@ pub fn defaults_for_network(chain: &Chain) -> Vec<BaselineSource> {
             BaselineSource::SushiSwap,
             BaselineSource::Baoswap,
             BaselineSource::Swapr,
+            BaselineSource::UniswapV3,
         ],
         Chain::ArbitrumOne => vec![
             BaselineSource::UniswapV2,
@@ -73,7 +74,6 @@ pub fn defaults_for_network(chain: &Chain) -> Vec<BaselineSource> {
             BaselineSource::ZeroEx,
             BaselineSource::UniswapV3,
         ],
-        Chain::Lens => vec![BaselineSource::UniswapV3],
         Chain::Linea => vec![BaselineSource::UniswapV3],
         Chain::Plasma => vec![BaselineSource::UniswapV3],
         Chain::Ink => vec![BaselineSource::UniswapV3],

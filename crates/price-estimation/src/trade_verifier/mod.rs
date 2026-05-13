@@ -2,31 +2,24 @@ use {
     super::{Estimate, Verification},
     crate::{
         trade_finding::{
-            Interaction,
             QuoteExecution,
             TradeKind,
-            external::dto::{self, JitOrder},
+            external::dto::{self, Side},
             map_interactions_data,
         },
-        trade_verifier::{code_fetching::CodeFetching, tenderly_api::TenderlyCodeSimulator},
-        utils::encoding::{EncodedInteraction, EncodedSettlement, EncodedTrade, encode_trade},
+        trade_verifier::code_fetching::CodeFetching,
     },
     ::alloy::sol_types::SolCall,
-    alloy::{
-        primitives::{Address, Bytes, U256, address, aliases::I512, map::AddressMap},
-        rpc::types::{eth::state::StateOverride, state::AccountOverride},
-    },
-    anyhow::{Context, Result, anyhow},
-    balance_overrides::{BalanceOverrideRequest, BalanceOverriding},
+    alloy::primitives::{Address, Bytes, U256, address, aliases::I512},
+    anyhow::{Context, Result},
     bigdecimal::BigDecimal,
-    contracts::alloy::{
-        GPv2Settlement,
+    contracts::{
         WETH9,
-        support::{AnyoneAuthenticator, Solver, Spardose, Trader},
+        support::{Solver, Spardose, Trader},
     },
-    ethrpc::{Web3, block_stream::CurrentBlockWatcher},
     model::{
         DomainSeparator,
+        interaction::InteractionData,
         order::{BUY_ETH_ADDRESS, OrderData, OrderKind},
         signature::{Signature, SigningScheme},
     },
@@ -40,6 +33,17 @@ use {
         },
         nonzero::NonZeroU256,
     },
+    simulator::{
+        simulation_builder::{
+            self as sim_builder,
+            AccountOverrideRequest,
+            ExecutionAmount,
+            PriceEncoding,
+            SettlementSimulator,
+            Solver as SimulationSolver,
+        },
+        tenderly,
+    },
     std::{
         collections::{HashMap, HashSet},
         sync::Arc,
@@ -48,7 +52,6 @@ use {
 };
 
 pub mod code_fetching;
-pub mod tenderly_api;
 
 #[async_trait::async_trait]
 pub trait TradeVerifying: Send + Sync + 'static {
@@ -66,51 +69,42 @@ pub trait TradeVerifying: Send + Sync + 'static {
 /// and determines a price estimate based off of that simulation.
 #[derive(Clone)]
 pub struct TradeVerifier {
-    web3: Web3,
-    simulator: Option<Arc<TenderlyCodeSimulator>>,
+    tenderly: Option<Arc<dyn tenderly::Api>>,
+    simulator: SettlementSimulator,
     code_fetcher: Arc<dyn CodeFetching>,
-    balance_overrides: Arc<dyn BalanceOverriding>,
-    block_stream: CurrentBlockWatcher,
-    settlement: GPv2Settlement::Instance,
-    native_token: Address,
     quote_inaccuracy_limit: BigRational,
-    domain_separator: DomainSeparator,
     tokens_without_verification: HashSet<Address>,
+    min_gas_amount_for_unverified_quotes: u32,
+    max_gas_amount_for_unverified_quotes: u32,
 }
 
 impl TradeVerifier {
-    const DEFAULT_GAS: u64 = 12_000_000;
     const SPARDOSE: Address = address!("0000000000000000000000000000000000020000");
     const TRADER_IMPL: Address = address!("0000000000000000000000000000000000010000");
 
-    #[expect(clippy::too_many_arguments)]
-    pub async fn new(
-        web3: Web3,
-        simulator: Option<Arc<TenderlyCodeSimulator>>,
+    pub fn new(
+        simulator: SettlementSimulator,
+        tenderly: Option<Arc<dyn tenderly::Api>>,
         code_fetcher: Arc<dyn CodeFetching>,
-        balance_overrides: Arc<dyn BalanceOverriding>,
-        block_stream: CurrentBlockWatcher,
-        settlement: Address,
-        native_token: Address,
         quote_inaccuracy_limit: BigDecimal,
         tokens_without_verification: HashSet<Address>,
-    ) -> Result<Self> {
-        let settlement_contract =
-            GPv2Settlement::GPv2Settlement::new(settlement, web3.provider.clone());
-        let domain_separator =
-            DomainSeparator(settlement_contract.domainSeparator().call().await?.0);
-        Ok(Self {
+        min_gas_amount_for_unverified_quotes: u32,
+        max_gas_amount_for_unverified_quotes: u32,
+    ) -> Self {
+        assert!(
+            min_gas_amount_for_unverified_quotes <= max_gas_amount_for_unverified_quotes,
+            "gas floor ({min_gas_amount_for_unverified_quotes}) exceeds gas ceiling \
+             ({max_gas_amount_for_unverified_quotes}) for unverified quotes"
+        );
+        Self {
+            tenderly,
             simulator,
             code_fetcher,
-            balance_overrides,
-            block_stream,
-            settlement: settlement_contract,
-            native_token,
             quote_inaccuracy_limit: big_decimal_to_big_rational(&quote_inaccuracy_limit),
-            web3,
-            domain_separator,
             tokens_without_verification,
-        })
+            min_gas_amount_for_unverified_quotes,
+            max_gas_amount_for_unverified_quotes,
+        }
     }
 
     async fn verify_inner(
@@ -122,118 +116,185 @@ impl TradeVerifier {
     ) -> Result<Estimate, Error> {
         let start = std::time::Instant::now();
 
-        // this may change the `verification` parameter (to make more
-        // quotes verifiable) so we do it as the first thing to ensure
-        // that all the following code uses the updated value
-        let overrides = self
-            .prepare_state_overrides(&mut verification, query, trade)
-            .await
-            .map_err(Error::SimulationFailed)?;
+        if verification.from.is_zero() {
+            verification.from = Address::random();
+            tracing::debug!(
+                trader = ?verification.from,
+                "using random trader address with fake balances"
+            );
+        }
+
+        let override_requests = self
+            .prepare_state_overrides(&verification, query, trade)
+            .await?;
 
         // Use `tx_origin` if response indicates that a special address is needed for
         // the simulation to pass. Otherwise just use the solver address.
         let solver_address = trade.tx_origin().unwrap_or(trade.solver());
 
-        let (tokens, clearing_prices) = match trade {
-            TradeKind::Legacy(_) => {
-                let tokens = vec![query.sell_token, query.buy_token];
-                let prices = match query.kind {
-                    OrderKind::Sell => {
-                        vec![*out_amount, query.in_amount.get()]
-                    }
-                    OrderKind::Buy => {
-                        vec![query.in_amount.get(), *out_amount]
-                    }
-                };
-                (tokens, prices)
-            }
-            TradeKind::Regular(trade) => trade.clearing_prices.iter().unzip(),
+        // `tokens` is passed to `Solver::swap` so it can measure balance changes;
+        // it is independent of the settlement's token/price vectors.
+        let tokens: Vec<Address> = match trade {
+            TradeKind::Legacy(_) => vec![query.sell_token, query.buy_token],
+            TradeKind::Regular(trade) => trade.clearing_prices.keys().copied().collect(),
+        };
+        let (fake_sell_price, fake_buy_price) = match trade {
+            TradeKind::Legacy(_) => match query.kind {
+                OrderKind::Sell => (*out_amount, query.in_amount.get()),
+                OrderKind::Buy => (query.in_amount.get(), *out_amount),
+            },
+            TradeKind::Regular(trade) => (
+                trade
+                    .clearing_prices
+                    .get(&query.sell_token)
+                    .copied()
+                    .unwrap_or(U256::ONE),
+                trade
+                    .clearing_prices
+                    .get(&query.buy_token)
+                    .copied()
+                    .unwrap_or(U256::ONE),
+            ),
         };
 
-        let settlement = encode_settlement(
-            query,
-            &verification,
-            trade,
-            &tokens,
-            &clearing_prices,
-            out_amount,
-            self.native_token,
-            &self.domain_separator,
-            *self.settlement.address(),
-        )?;
-        let settlement = add_balance_queries(settlement, query, &verification, solver_address);
+        let (sell_amount, buy_amount) = match query.kind {
+            OrderKind::Sell => (query.in_amount, *out_amount),
+            OrderKind::Buy => (
+                NonZeroU256::try_from(*out_amount).context("computed sell amount is zero")?,
+                query.in_amount.get(),
+            ),
+        };
+        // Determine effective receiver (zero means owner receives)
+        let effective_receiver = if verification.receiver.is_zero() {
+            verification.from
+        } else {
+            verification.receiver
+        };
 
-        let settle_call = legacy_settlement_to_alloy(settlement).abi_encode();
-        let block = *self.block_stream.borrow();
+        // storeBalance interactions surrounding the settlement to measure the actual
+        // out_amount
+        let (tracked_token, tracked_owner) = match query.kind {
+            OrderKind::Sell => (query.buy_token, effective_receiver),
+            OrderKind::Buy => (query.sell_token, verification.from),
+        };
+        let store_balance = InteractionData {
+            target: solver_address,
+            value: U256::ZERO,
+            call_data: Solver::Solver::storeBalanceCall {
+                token: tracked_token,
+                owner: tracked_owner,
+                countGas: true,
+            }
+            .abi_encode(),
+        };
 
-        let solver = Solver::Instance::new(solver_address, self.web3.provider.clone());
-        let swap_simulation = solver.swap(
-                *self.settlement.address(),
+        // pre: [verification.pre, trade.pre, trade_setup, storeBalance_before]
+        let pre_interactions = map_interactions_data(
+            verification
+                .pre_interactions
+                .iter()
+                .chain(trade.pre_interactions()),
+        )
+        .into_iter()
+        .chain([self.trade_setup_interaction(out_amount, &verification, query, trade)])
+        .chain([store_balance.clone()]);
+
+        // WETH unwrap so ETH buy orders can pay out native tokens
+        let weth_unwrap = (query.buy_token == BUY_ETH_ADDRESS).then(|| InteractionData {
+            target: self.simulator.native_token(),
+            value: U256::ZERO,
+            call_data: WETH9::WETH9::withdrawCall { wad: buy_amount }.abi_encode(),
+        });
+        // main: [trade.main, weth_unwrap]
+        let main_interactions = map_interactions_data(trade.interactions())
+            .into_iter()
+            .chain(weth_unwrap);
+
+        // post: [storeBalance_after, verification.post]
+        let post_interactions = std::iter::once(store_balance)
+            .chain(map_interactions_data(&verification.post_interactions));
+
+        // Set limit amounts to always pass the settlement check so the actual
+        // out_amount can be measured via the storeBalance interactions.
+        let (fake_sell_amount, fake_buy_amount) = match query.kind {
+            OrderKind::Sell => (sell_amount.get(), U256::ZERO),
+            OrderKind::Buy => (sell_amount.get().max(U256::from(u128::MAX)), buy_amount),
+        };
+        let fake_order = sim_builder::Order::new(OrderData {
+            sell_token: query.sell_token,
+            sell_amount: fake_sell_amount,
+            buy_token: query.buy_token,
+            buy_amount: fake_buy_amount,
+            receiver: Some(verification.receiver),
+            valid_to: u32::MAX,
+            app_data: Default::default(),
+            fee_amount: U256::ZERO,
+            kind: query.kind,
+            partially_fillable: false,
+            sell_token_balance: verification.sell_token_source,
+            buy_token_balance: verification.buy_token_destination,
+        })
+        .with_signature(
+            verification.from,
+            Signature::default_with(SigningScheme::Eip1271),
+        )
+        .fill_at(
+            ExecutionAmount::Full,
+            PriceEncoding::Custom {
+                sell_price: fake_sell_price,
+                buy_price: fake_buy_price,
+            },
+        );
+
+        let jit_orders = encode_jit_orders(trade, &self.simulator.domain_separator())?;
+
+        let eth_call_inputs = self
+            .simulator
+            .new_simulation_builder()
+            .with_orders(std::iter::once(fake_order).chain(jit_orders))
+            .from_solver(SimulationSolver::OriginUnaltered(solver_address))
+            .append_pre_interactions(pre_interactions)
+            .append_main_interactions(main_interactions)
+            .append_post_interactions(post_interactions)
+            .with_overrides(override_requests)
+            .build()
+            .await?;
+
+        // after assembling the state overrides and settlement call data we need to
+        // craft a call that takes the settle call data as an argument.
+        let settlement_target = eth_call_inputs.to;
+        let calldata: Bytes = eth_call_inputs.calldata.clone();
+
+        let solver_contract = Solver::Instance::new(solver_address, self.simulator.provider());
+        let swap_call = solver_contract
+            .swap(
+                settlement_target,
                 tokens.clone(),
-                verification.receiver,
-                settle_call.into(),
+                effective_receiver,
+                calldata,
             )
-            // Initiate tx as solver so gas doesn't get deducted from user's ETH.
             .from(solver_address)
-            .to(solver_address)
-            .gas(Self::DEFAULT_GAS)
-            // Use a high enough non-zero gas price to catch tokens with special logic
-            // for gas_price == 0 but also avoid reverts due to too low gas price.
-            // The exact price is not important since we are only interested in the used
-            // gas units anyway.
-            .gas_price(
-                u128::try_from(block.gas_price.saturating_mul(U256::from(2)))
-                .map_err(|err| anyhow!(err))
-                .context("converting gas price to u128")?
-            );
+            .gas(self.simulator.max_gas_limit());
 
-        if let Some(tenderly) = &self.simulator
+        let tx = swap_call.clone().into_transaction_request();
+        let result = swap_call
+            .call()
+            .overrides(eth_call_inputs.state_overrides.clone())
+            .block(eth_call_inputs.block.into())
+            .await;
+
+        if let Some(tenderly) = &self.tenderly
             && let Err(err) = tenderly.log_simulation_command(
-                swap_simulation.clone().into_transaction_request(),
-                overrides.clone(),
-                Some(block.number),
+                tx,
+                eth_call_inputs.state_overrides,
+                eth_call_inputs.block.into(),
             )
         {
             tracing::debug!(?err, "could not log tenderly simulation command");
         }
-
-        let output = swap_simulation
-            .call()
-            .overrides(overrides)
-            .await
+        let output = result
             .context("failed to simulate quote")
             .map_err(Error::SimulationFailed);
-
-        // TODO remove when quoters stop signing zeroex RFQ orders for `tx.origin:
-        // 0x0000` (#2693)
-        if let Err(err) = &output {
-            // Currently we know that if a trade requests to be simulated from `tx.origin:
-            // 0x0000` it's because the solver signs zeroex RFQ orders which
-            // require that origin. However, setting this `tx.origin` actually
-            // results in invalid RFQ orders and until the solver signs orders
-            // for a different `tx.origin` we need to pretend these
-            // quotes actually simulated successfully to not lose these competitive quotes
-            // when we enable quote verification in prod.
-            if trade.tx_origin() == Some(Address::ZERO) {
-                let estimate = Estimate {
-                    out_amount: *out_amount,
-                    gas: trade.gas_estimate().context("no gas estimate")?,
-                    solver: trade.solver(),
-                    verified: true,
-                    execution: QuoteExecution {
-                        interactions: map_interactions_data(trade.interactions()),
-                        pre_interactions: map_interactions_data(trade.pre_interactions()),
-                        jit_orders: trade.jit_orders().cloned().collect(),
-                    },
-                };
-                tracing::warn!(
-                    ?estimate,
-                    ?err,
-                    "quote used invalid zeroex RFQ order; pass verification anyway"
-                );
-                return Ok(estimate);
-            }
-        };
 
         let mut summary = SettleOutput::from_swap(output?, query.kind, &tokens)?;
 
@@ -248,7 +309,7 @@ impl TradeVerifier {
 
             // It looks like the contract lost a lot of sell tokens but only because it was
             // the trader and had to pay for the trade. Adjust tokens lost downward.
-            if verification.from == *self.settlement.address() {
+            if verification.from == self.simulator.settlement_address() {
                 summary
                     .tokens_lost
                     .entry(query.sell_token)
@@ -257,7 +318,7 @@ impl TradeVerifier {
             // It looks like the contract gained a lot of buy tokens (negative loss) but
             // only because it was the receiver and got the payout. Adjust the tokens lost
             // upward.
-            if verification.receiver == *self.settlement.address() {
+            if verification.receiver == self.simulator.settlement_address() {
                 summary
                     .tokens_lost
                     .entry(query.buy_token)
@@ -328,11 +389,20 @@ impl TradeVerifier {
     /// trade.
     async fn prepare_state_overrides(
         &self,
-        verification: &mut Verification,
+        verification: &Verification,
         query: &PriceQuery,
         trade: &TradeKind,
-    ) -> Result<StateOverride> {
-        let mut overrides = AddressMap::default();
+    ) -> Result<Vec<AccountOverrideRequest>> {
+        let mut requests = vec![
+            // Setup the funding contract override. Regardless of whether or not the
+            // contract has funds, it needs to exist in order to not revert
+            // simulations (Solidity reverts on attempts to call addresses without
+            // any code).
+            AccountOverrideRequest::Code {
+                account: Self::SPARDOSE,
+                code: Spardose::Spardose::DEPLOYED_BYTECODE.clone(),
+            },
+        ];
 
         // Provide mocked balances if possible to the spardose to allow it to
         // give some balances to the trader in order to verify trades even for
@@ -343,50 +413,26 @@ impl TradeVerifier {
         // not alter solver balances which may be used during settlement. We use
         // a similar strategy for determining whether or not to set approvals on
         // behalf of the trader.
-        match self
-            .balance_overrides
-            .state_override(BalanceOverrideRequest {
-                token: query.sell_token,
-                holder: Self::SPARDOSE,
-                amount: match query.kind {
-                    OrderKind::Sell => query.in_amount.get(),
-                    OrderKind::Buy => trade.out_amount(
-                        &query.buy_token,
-                        &query.sell_token,
-                        &query.in_amount.get(),
-                        &query.kind,
-                    )?,
-                },
-            })
-            .await
-        {
-            Some((token, solver_balance_override)) => {
-                tracing::trace!(?solver_balance_override, "solver balance override enabled");
-                overrides.insert(token, solver_balance_override);
-
-                if verification.from.is_zero() {
-                    verification.from = Address::random();
-                    tracing::debug!(
-                        trader = ?verification.from,
-                        "use random trader address with fake balances"
-                    );
-                }
-            }
-            _ => {
-                if verification.from.is_zero() {
-                    anyhow::bail!("trader is zero address and balances can not be faked");
-                }
-            }
-        }
+        let needed = match query.kind {
+            OrderKind::Sell => query.in_amount.get(),
+            OrderKind::Buy => trade.out_amount(
+                &query.buy_token,
+                &query.sell_token,
+                &query.in_amount.get(),
+                &query.kind,
+            )?,
+        };
+        requests.push(AccountOverrideRequest::Balance {
+            holder: Self::SPARDOSE,
+            token: query.sell_token,
+            amount: spardose_amount_with_buffer(needed),
+        });
 
         // Set up mocked trader.
-        overrides.insert(
-            verification.from,
-            AccountOverride {
-                code: Some(Trader::Trader::DEPLOYED_BYTECODE.clone()),
-                ..Default::default()
-            },
-        );
+        requests.push(AccountOverrideRequest::Code {
+            account: verification.from,
+            code: Trader::Trader::DEPLOYED_BYTECODE.clone(),
+        });
 
         // If the trader is a smart contract we also need to store its implementation
         // to proxy into it during the simulation.
@@ -396,99 +442,62 @@ impl TradeVerifier {
             .await
             .context("failed to fetch trader code")?;
         if !trader_impl.0.is_empty() {
-            overrides.insert(
-                Self::TRADER_IMPL,
-                AccountOverride {
-                    code: Some(trader_impl),
-                    ..Default::default()
-                },
-            );
+            requests.push(AccountOverrideRequest::Code {
+                account: Self::TRADER_IMPL,
+                code: trader_impl,
+            });
         }
 
-        // Setup the funding contract override. Regardless of whether or not the
-        // contract has funds, it needs to exist in order to not revert
-        // simulations (Solidity reverts on attempts to call addresses without
-        // any code).
-        overrides.insert(
-            Self::SPARDOSE,
-            AccountOverride {
-                code: Some(Spardose::Spardose::DEPLOYED_BYTECODE.clone()),
-                ..Default::default()
-            },
-        );
+        // Set up mocked solver with enough ETH to proceed even if the real account
+        // holds none.
+        let solver = trade.tx_origin().unwrap_or(trade.solver());
+        requests.push(AccountOverrideRequest::Code {
+            account: solver,
+            code: Solver::Solver::DEPLOYED_BYTECODE.clone(),
+        });
+        requests.push(AccountOverrideRequest::SufficientEthBalance(solver));
 
-        // Set up mocked solver.
-        let solver_override = AccountOverride {
-            code: Some(Solver::Solver::DEPLOYED_BYTECODE.clone()),
-            // Allow solver simulations to proceed even if the real account holds no ETH.
-            // The number is obscenely large, but not max to avoid potential overflows.
-            // We had this set to eth(1), but some simulations require more than that on non-ETH
-            // netowrks e.g. polygon so it led to reverts.
-            balance: Some(U256::MAX / U256::from(2)),
-            ..Default::default()
-        };
-
-        // If the trade requires a special tx.origin we also need to fake the
-        // authenticator.
-        if trade
-            .tx_origin()
-            .is_some_and(|origin| origin != trade.solver())
+        // If the trade requires a special tx.origin we also need to allow list
+        // it in the authenticator
+        if let Some(custom_origin) = trade.tx_origin()
+            && custom_origin != trade.solver()
         {
-            let authenticator = self
-                .settlement
-                .authenticator()
-                .call()
-                .await
-                .context("could not fetch authenticator")?;
-            overrides.insert(
-                authenticator,
-                AccountOverride {
-                    code: Some(Bytes::from(
-                        AnyoneAuthenticator::AnyoneAuthenticator::DEPLOYED_BYTECODE.to_vec(),
-                    )),
-                    ..Default::default()
-                },
-            );
+            requests.push(AccountOverrideRequest::AuthenticateAsSolver(custom_origin))
         }
-        overrides.insert(trade.tx_origin().unwrap_or(trade.solver()), solver_override);
 
-        Ok(overrides)
+        Ok(requests)
     }
-}
 
-fn legacy_settlement_to_alloy(
-    settlement: EncodedSettlement,
-) -> GPv2Settlement::GPv2Settlement::settleCall {
-    GPv2Settlement::GPv2Settlement::settleCall {
-        tokens: settlement.tokens,
-        clearingPrices: settlement.clearing_prices,
-        interactions: settlement.interactions.map(|interactions| {
-            interactions
-                .into_iter()
-                .map(|i| GPv2Settlement::GPv2Interaction::Data {
-                    target: i.0,
-                    value: i.1,
-                    callData: i.2.0.into(),
-                })
-                .collect()
-        }),
-        trades: settlement
-            .trades
-            .into_iter()
-            .map(|t| GPv2Settlement::GPv2Trade::Data {
-                sellTokenIndex: t.0,
-                buyTokenIndex: t.1,
-                receiver: t.2,
-                sellAmount: t.3,
-                buyAmount: t.4,
-                validTo: t.5,
-                appData: t.6,
-                feeAmount: t.7,
-                flags: t.8,
-                executedAmount: t.9,
-                signature: t.10,
-            })
-            .collect(),
+    /// Create interaction that sets up the trade right before transfering
+    /// funds. This interaction does nothing if the user-provided
+    /// pre-interactions already set everything up (e.g. approvals,
+    /// balances). That way we can correctly verify quotes with or without
+    /// these user pre-interactions with helpful error messages.
+    fn trade_setup_interaction(
+        &self,
+        out_amount: &U256,
+        verification: &Verification,
+        query: &PriceQuery,
+        trade: &TradeKind,
+    ) -> InteractionData {
+        let sell_amount = match query.kind {
+            OrderKind::Sell => query.in_amount.get(),
+            OrderKind::Buy => *out_amount,
+        };
+        let setup_call = Solver::Solver::ensureTradePreconditionsCall {
+            trader: verification.from,
+            settlementContract: self.simulator.settlement_address(),
+            sellToken: query.sell_token,
+            sellAmount: sell_amount,
+            nativeToken: self.simulator.native_token(),
+            spardose: Self::SPARDOSE,
+        }
+        .abi_encode();
+        InteractionData {
+            target: trade.solver(),
+            value: U256::ZERO,
+            call_data: setup_call,
+        }
     }
 }
 
@@ -512,16 +521,23 @@ impl TradeVerifying for TradeVerifier {
 
         let unverified_result = trade
             .gas_estimate()
-            .map(|gas| Estimate {
-                out_amount,
-                gas,
-                solver: trade.solver(),
-                verified: false,
-                execution: QuoteExecution {
-                    interactions: map_interactions_data(trade.interactions()),
-                    pre_interactions: map_interactions_data(trade.pre_interactions()),
-                    jit_orders: trade.jit_orders().cloned().collect(),
-                },
+            .map(|gas| {
+                let gas = gas.clamp(
+                    self.min_gas_amount_for_unverified_quotes as u64,
+                    self.max_gas_amount_for_unverified_quotes as u64,
+                );
+
+                Estimate {
+                    out_amount,
+                    gas,
+                    solver: trade.solver(),
+                    verified: false,
+                    execution: QuoteExecution {
+                        interactions: map_interactions_data(trade.interactions()),
+                        pre_interactions: map_interactions_data(trade.pre_interactions()),
+                        jit_orders: trade.jit_orders().cloned().collect(),
+                    },
+                }
             })
             .context("solver provided no gas estimate");
 
@@ -568,267 +584,6 @@ impl TradeVerifying for TradeVerifier {
             }
         }
     }
-}
-
-fn encode_interactions<'a>(
-    interactions: impl IntoIterator<Item = &'a Interaction>,
-) -> Vec<EncodedInteraction> {
-    interactions.into_iter().map(|i| i.encode()).collect()
-}
-
-#[expect(clippy::too_many_arguments)]
-fn encode_settlement(
-    query: &PriceQuery,
-    verification: &Verification,
-    trade: &TradeKind,
-    tokens: &[Address],
-    clearing_prices: &[U256],
-    out_amount: &U256,
-    native_token: Address,
-    domain_separator: &DomainSeparator,
-    settlement: Address,
-) -> Result<EncodedSettlement> {
-    let mut trade_interactions = encode_interactions(trade.interactions());
-    if query.buy_token == BUY_ETH_ADDRESS {
-        // Because the `driver` manages `WETH` unwraps under the hood the `TradeFinder`
-        // does not have to emit unwraps to pay out `ETH` in a trade.
-        // However, for the simulation to be successful this has to happen so we do it
-        // ourselves here.
-        let buy_amount = match query.kind {
-            OrderKind::Sell => *out_amount,
-            OrderKind::Buy => query.in_amount.get(),
-        };
-        trade_interactions.push((
-            native_token,
-            U256::ZERO,
-            WETH9::WETH9::withdrawCall { wad: buy_amount }
-                .abi_encode()
-                .into(),
-        ));
-        tracing::trace!("adding unwrap interaction for paying out ETH");
-    }
-
-    let fake_trade = encode_fake_trade(query, verification, out_amount, tokens)?;
-    let mut trades = vec![fake_trade];
-    if let TradeKind::Regular(trade) = trade {
-        trades.extend(encode_jit_orders(
-            &trade.jit_orders,
-            tokens,
-            domain_separator,
-        )?);
-    }
-
-    // Execute interaction to set up trade right before transfering funds.
-    // This interaction does nothing if the user-provided pre-interactions
-    // already set everything up (e.g. approvals, balances). That way we can
-    // correctly verify quotes with or without these user pre-interactions
-    // with helpful error messages.
-    let trade_setup_interaction = {
-        let sell_amount = match query.kind {
-            OrderKind::Sell => query.in_amount.get(),
-            OrderKind::Buy => *out_amount,
-        };
-        let solver_address = trade.solver();
-        let setup_call = Solver::Solver::ensureTradePreconditionsCall {
-            trader: verification.from,
-            settlementContract: settlement,
-            sellToken: query.sell_token,
-            sellAmount: sell_amount,
-            nativeToken: native_token,
-            spardose: TradeVerifier::SPARDOSE,
-        }
-        .abi_encode();
-        Interaction {
-            target: solver_address,
-            value: U256::ZERO,
-            data: setup_call,
-        }
-    };
-
-    let user_interactions = verification.pre_interactions.iter().cloned();
-    let pre_interactions: Vec<_> = user_interactions
-        .chain(trade.pre_interactions().cloned())
-        .chain([trade_setup_interaction])
-        .collect();
-
-    Ok(EncodedSettlement {
-        tokens: tokens.to_vec(),
-        clearing_prices: clearing_prices.to_vec(),
-        trades,
-        interactions: [
-            encode_interactions(&pre_interactions),
-            trade_interactions,
-            encode_interactions(&verification.post_interactions),
-        ],
-    })
-}
-
-fn encode_fake_trade(
-    query: &PriceQuery,
-    verification: &Verification,
-    out_amount: &U256,
-    tokens: &[Address],
-) -> Result<EncodedTrade, Error> {
-    // Configure the most disadvantageous trade possible (while taking possible
-    // overflows into account). Should the trader not receive the amount promised by
-    // the [`Trade`] the simulation will still work and we can compute the actual
-    // [`Trade::out_amount`] afterwards.
-    let (sell_amount, buy_amount) = match query.kind {
-        OrderKind::Sell => (query.in_amount.get(), U256::ZERO),
-        OrderKind::Buy => (
-            (*out_amount).max(U256::from(u128::MAX)),
-            query.in_amount.get(),
-        ),
-    };
-    let fake_order = OrderData {
-        sell_token: query.sell_token,
-        sell_amount,
-        buy_token: query.buy_token,
-        buy_amount,
-        receiver: Some(verification.receiver),
-        valid_to: u32::MAX,
-        app_data: Default::default(),
-        fee_amount: U256::ZERO,
-        kind: query.kind,
-        partially_fillable: false,
-        sell_token_balance: verification.sell_token_source,
-        buy_token_balance: verification.buy_token_destination,
-    };
-
-    let fake_signature = Signature::default_with(SigningScheme::Eip1271);
-    let encoded_trade = encode_trade(
-        &fake_order,
-        &fake_signature,
-        verification.from,
-        // the tokens set length is small so the linear search is acceptable
-        tokens
-            .iter()
-            .position(|token| token == &query.sell_token)
-            .context("missing sell token index")?,
-        tokens
-            .iter()
-            .position(|token| token == &query.buy_token)
-            .context("missing buy token index")?,
-        query.in_amount.get(),
-    );
-
-    Ok(encoded_trade)
-}
-
-fn encode_jit_orders(
-    jit_orders: &[dto::JitOrder],
-    tokens: &[Address],
-    domain_separator: &DomainSeparator,
-) -> Result<Vec<EncodedTrade>, Error> {
-    jit_orders
-        .iter()
-        .map(|jit_order| {
-            let order_data = OrderData {
-                sell_token: jit_order.sell_token,
-                buy_token: jit_order.buy_token,
-                receiver: Some(jit_order.receiver),
-                sell_amount: jit_order.sell_amount,
-                buy_amount: jit_order.buy_amount,
-                valid_to: jit_order.valid_to,
-                app_data: jit_order.app_data,
-                fee_amount: U256::ZERO,
-                kind: match &jit_order.side {
-                    dto::Side::Buy => OrderKind::Buy,
-                    dto::Side::Sell => OrderKind::Sell,
-                },
-                partially_fillable: jit_order.partially_fillable,
-                sell_token_balance: jit_order.sell_token_source,
-                buy_token_balance: jit_order.buy_token_destination,
-            };
-            let (owner, signature) =
-                recover_jit_order_owner(jit_order, &order_data, domain_separator)?;
-
-            Ok(encode_trade(
-                &order_data,
-                &signature,
-                owner,
-                // the tokens set length is small so the linear search is acceptable
-                tokens
-                    .iter()
-                    .position(|token| *token == jit_order.sell_token)
-                    .context("missing jit order sell token index")?,
-                tokens
-                    .iter()
-                    .position(|token| *token == jit_order.buy_token)
-                    .context("missing jit order buy token index")?,
-                jit_order.executed_amount,
-            ))
-        })
-        .collect::<Result<Vec<EncodedTrade>, Error>>()
-}
-
-/// Recovers the owner and signature from a `JitOrder`.
-fn recover_jit_order_owner(
-    jit_order: &JitOrder,
-    order_data: &OrderData,
-    domain_separator: &DomainSeparator,
-) -> Result<(Address, Signature), Error> {
-    let (owner, signature) = match jit_order.signing_scheme {
-        SigningScheme::Eip1271 => {
-            let (owner, signature) = jit_order.signature.split_at(20);
-            let owner = Address::from_slice(owner);
-            let signature = Signature::from_bytes(jit_order.signing_scheme, signature)?;
-            (owner, signature)
-        }
-        SigningScheme::PreSign => {
-            let owner = Address::from_slice(&jit_order.signature);
-            let signature = Signature::from_bytes(jit_order.signing_scheme, Vec::new().as_slice())?;
-            (owner, signature)
-        }
-        _ => {
-            let signature = Signature::from_bytes(jit_order.signing_scheme, &jit_order.signature)?;
-            let owner = signature
-                .recover(domain_separator, &order_data.hash_struct())?
-                .context("could not recover the owner")?
-                .signer;
-            (owner, signature)
-        }
-    };
-    Ok((owner, signature))
-}
-
-/// Adds the interactions that are only needed to query important balances
-/// throughout the simulation.
-/// These balances will get used to compute an accurate price for the trade.
-fn add_balance_queries(
-    mut settlement: EncodedSettlement,
-    query: &PriceQuery,
-    verification: &Verification,
-    solver_address: Address,
-) -> EncodedSettlement {
-    let (token, owner) = match query.kind {
-        // track how much `buy_token` the `receiver` actually got
-        OrderKind::Sell => {
-            let receiver = match verification.receiver.is_zero() {
-                // Settlement contract sends fund to owner if receiver is the 0 address.
-                true => verification.from,
-                false => verification.receiver,
-            };
-
-            (query.buy_token, receiver)
-        }
-        // track how much `sell_token` the `from` address actually spent
-        OrderKind::Buy => (query.sell_token, verification.from),
-    };
-    let query_balance_call = Solver::Solver::storeBalanceCall {
-        token,
-        owner,
-        countGas: true,
-    }
-    .abi_encode();
-
-    let interaction = (solver_address, U256::ZERO, query_balance_call.into());
-
-    // query balance query at the end of pre-interactions
-    settlement.interactions[0].push(interaction.clone());
-    // query balance right after we payed out all `buy_token`
-    settlement.interactions[2].insert(0, interaction);
-    settlement
 }
 
 /// Analyzed output of `Solver::settle` smart contract call.
@@ -947,6 +702,77 @@ pub struct PriceQuery {
     pub in_amount: NonZeroU256,
 }
 
+fn encode_jit_orders(
+    trade: &TradeKind,
+    domain_separator: &DomainSeparator,
+) -> Result<Vec<sim_builder::Order>> {
+    let TradeKind::Regular(trade) = trade else {
+        return Ok(vec![]);
+    };
+
+    trade
+        .jit_orders
+        .iter()
+        .map(|jit_order| {
+            let order_data = OrderData {
+                sell_token: jit_order.sell_token,
+                buy_token: jit_order.buy_token,
+                receiver: Some(jit_order.receiver),
+                sell_amount: jit_order.sell_amount,
+                buy_amount: jit_order.buy_amount,
+                valid_to: jit_order.valid_to,
+                app_data: jit_order.app_data,
+                fee_amount: U256::ZERO,
+                kind: match &jit_order.side {
+                    Side::Buy => OrderKind::Buy,
+                    Side::Sell => OrderKind::Sell,
+                },
+                partially_fillable: jit_order.partially_fillable,
+                sell_token_balance: jit_order.sell_token_source,
+                buy_token_balance: jit_order.buy_token_destination,
+            };
+            let (owner, signature) =
+                recover_jit_order_owner(jit_order, &order_data, domain_separator)?;
+            Ok(sim_builder::Order::new(order_data)
+                .with_signature(owner, signature)
+                .fill_at(
+                    ExecutionAmount::Explicit(jit_order.executed_amount),
+                    PriceEncoding::LimitPrice,
+                ))
+        })
+        .collect::<Result<_>>()
+}
+
+/// Recovers the owner and signature from a `JitOrder`.
+fn recover_jit_order_owner(
+    jit_order: &dto::JitOrder,
+    order_data: &OrderData,
+    domain_separator: &DomainSeparator,
+) -> Result<(Address, Signature)> {
+    let (owner, signature) = match jit_order.signing_scheme {
+        SigningScheme::Eip1271 => {
+            let (owner, signature) = jit_order.signature.split_at(20);
+            let owner = Address::from_slice(owner);
+            let signature = Signature::from_bytes(jit_order.signing_scheme, signature)?;
+            (owner, signature)
+        }
+        SigningScheme::PreSign => {
+            let owner = Address::from_slice(&jit_order.signature);
+            let signature = Signature::from_bytes(jit_order.signing_scheme, Vec::new().as_slice())?;
+            (owner, signature)
+        }
+        _ => {
+            let signature = Signature::from_bytes(jit_order.signing_scheme, &jit_order.signature)?;
+            let owner = signature
+                .recover(domain_separator, &order_data.hash_struct())?
+                .context("could not recover the owner")?
+                .signer;
+            (owner, signature)
+        }
+    };
+    Ok((owner, signature))
+}
+
 #[derive(thiserror::Error, Debug)]
 enum Error {
     /// Verification logic ran successfully but the quote was deemed too
@@ -957,11 +783,43 @@ enum Error {
     /// Some error caused the simulation to not finish successfully.
     #[error("quote could not be simulated")]
     SimulationFailed(#[from] anyhow::Error),
+    #[error("failed to build the verification simuation")]
+    FailedToBuildSimulation(#[from] simulator::simulation_builder::BuildError),
+}
+
+/// Spardose gets `needed` plus a 1% headroom, floored at 1 wei so the
+/// 1-wei boundary is still covered for small amounts where `needed / 100`
+/// truncates to 0. The buffer absorbs rounding or per-block accrual
+/// (aToken, rebasing, tiny fee-on-transfer) between our state_override
+/// read and the sim's execution. Spardose is a throwaway donor, so
+/// overshoot has no cost.
+fn spardose_amount_with_buffer(needed: U256) -> U256 {
+    let buffer = std::cmp::max(U256::ONE, needed / U256::from(100u64));
+    needed.saturating_add(buffer)
 }
 
 #[cfg(test)]
 mod tests {
     use {super::*, U256, maplit::hashmap, std::str::FromStr};
+
+    #[test]
+    fn spardose_amount_applies_1pct_overshoot() {
+        assert_eq!(
+            spardose_amount_with_buffer(U256::from(1_000_000_000_000_000_000u128)),
+            U256::from(1_010_000_000_000_000_000u128)
+        );
+        // Amounts below 100 still get at least 1 wei of headroom, so the
+        // boundary stays covered when integer division would otherwise
+        // round the 1% buffer to 0.
+        assert_eq!(
+            spardose_amount_with_buffer(U256::from(99u64)),
+            U256::from(100u64)
+        );
+        assert_eq!(spardose_amount_with_buffer(U256::ONE), U256::from(2u64));
+        assert_eq!(spardose_amount_with_buffer(U256::ZERO), U256::ONE);
+        // Saturates at U256::MAX instead of overflowing.
+        assert_eq!(spardose_amount_with_buffer(U256::MAX), U256::MAX);
+    }
 
     #[test]
     fn discards_inaccurate_quotes() {
