@@ -177,9 +177,13 @@ pub async fn run(config: Configuration) {
         .or_else(|| FlashLoanRouter::deployment_address(&chain_id))
         .expect("no flashloan router deployment for this chain");
 
-    verify_deployed_contract_constants(&settlement_contract, chain_id)
-        .await
-        .expect("Deployed contract constants don't match the ones in this binary");
+    if !config.skip_domain_separator_verification {
+        verify_deployed_contract_constants(&settlement_contract, chain_id)
+            .await
+            .expect("Deployed contract constants don't match the ones in this binary");
+    } else {
+        tracing::warn!("Skipping domain separator verification (useful for forks)");
+    }
     let domain_separator = DomainSeparator::new(chain_id, *settlement_contract.address());
     let db_config = crate::database::Config {
         max_pool_size: config.database.max_connections.get(),

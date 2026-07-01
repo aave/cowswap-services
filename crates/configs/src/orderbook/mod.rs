@@ -99,6 +99,11 @@ pub struct Configuration {
     #[serde(default)]
     pub eip1271_skip_creation_validation: bool,
 
+    /// Skip settlement contract domain separator verification. Useful for forks
+    /// where contracts were deployed with a different chain id.
+    #[serde(default)]
+    pub skip_domain_separator_verification: bool,
+
     /// Configuration for the native price estimation mechanism.
     pub native_price_estimation: NativePriceConfig,
 
@@ -207,6 +212,7 @@ pub mod test_util {
                 active_order_competition_threshold: default_active_order_competition_threshold(),
                 unsupported_tokens: Default::default(),
                 eip1271_skip_creation_validation: Default::default(),
+                skip_domain_separator_verification: Default::default(),
                 // NOTE: NativePriceConfig needs to be moved to the config crate and then it can
                 // have the test_default trait impl
                 native_price_estimation: NativePriceConfig::test_default(),
@@ -372,6 +378,7 @@ mod tests {
             ],
             banned_users: Default::default(),
             eip1271_skip_creation_validation: true,
+            skip_domain_separator_verification: false,
             hide_competition_before_deadline: true,
             native_price_estimation: NativePriceConfig {
                 estimators: NativePriceEstimators::new(vec![vec![NativePriceEstimator::CoinGecko]]),

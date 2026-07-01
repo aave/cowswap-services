@@ -94,6 +94,7 @@ fn build_module() -> Module {
         // 0x
         .add_contract(Contract::new("IZeroex").with_networks(networks![
             MAINNET => "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
+            MAINNET_FORK => "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
             SEPOLIA => "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
             ARBITRUM_ONE => "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
             BASE => "0xdef1c0ded9bec7f1a1670819833240f027b25eff",
@@ -122,11 +123,13 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2WeightedPoolFactory").with_networks(networks![
                 MAINNET => ("0x8E9aa87E45e92bad84D5F8DD1bff34Fb92637dE9", 12272147),
+                MAINNET_FORK => ("0x8E9aa87E45e92bad84D5F8DD1bff34Fb92637dE9", 12272147),
             ]),
         )
         .add_contract(
             Contract::new("BalancerV2WeightedPoolFactoryV3").with_networks(networks![
                 MAINNET => ("0x5Dd94Da3644DDD055fcf6B3E1aa310Bb7801EB8b", 16520627),
+                MAINNET_FORK => ("0x5Dd94Da3644DDD055fcf6B3E1aa310Bb7801EB8b", 16520627),
                 GNOSIS => ("0xC128a9954e6c874eA3d62ce62B468bA073093F25", 26226256),
                 AVALANCHE => ("0x94f68b54191F62f781Fe8298A8A5Fa3ed772d227", 26389236),
                 OPTIMISM => ("0xA0DAbEBAAd1b243BBb243f933013d560819eB66f", 72832703),
@@ -137,6 +140,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2WeightedPoolFactoryV4").with_networks(networks![
                 MAINNET => ("0x897888115Ada5773E02aA29F775430BFB5F34c51", 16878323),
+                MAINNET_FORK => ("0x897888115Ada5773E02aA29F775430BFB5F34c51", 16878323),
                 GNOSIS => ("0x6CaD2ea22BFA7F4C14Aae92E47F510Cd5C509bc7", 27055829),
                 SEPOLIA => ("0x7920BFa1b2041911b354747CA7A6cDD2dfC50Cfd", 3424893),
                 ARBITRUM_ONE => ("0xc7E5ED1054A24Ef31D827E6F86caA58B3Bc168d7", 72222060),
@@ -150,6 +154,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2WeightedPool2TokensFactory").with_networks(networks![
                 MAINNET => ("0xa5bf2ddf098bb0ef6d120c98217dd6b141c74ee0", 12349891),
+                MAINNET_FORK => ("0xa5bf2ddf098bb0ef6d120c98217dd6b141c74ee0", 12349891),
                 ARBITRUM_ONE => ("0xCF0a32Bbef8F064969F21f7e02328FB577382018", 222864),
                 OPTIMISM => ("0xdAE7e32ADc5d490a43cCba1f0c736033F2b4eFca", 7005512),
                 POLYGON => ("0x8E9aa87E45e92bad84D5F8DD1bff34Fb92637dE9", 15832998),
@@ -158,6 +163,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2StablePoolFactoryV2").with_networks(networks![
                 MAINNET => ("0x8df6efec5547e31b0eb7d1291b511ff8a2bf987c", 14934936),
+                MAINNET_FORK => ("0x8df6efec5547e31b0eb7d1291b511ff8a2bf987c", 14934936),
                 GNOSIS => ("0xf23b4DB826DbA14c0e857029dfF076b1c0264843", 25415344),
                 ARBITRUM_ONE => ("0xEF44D6786b2b4d544b7850Fe67CE6381626Bf2D6", 14244664),
                 OPTIMISM => ("0xeb151668006CD04DAdD098AFd0a82e78F77076c3", 11088891),
@@ -167,6 +173,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2LiquidityBootstrappingPoolFactory").with_networks(networks![
                 MAINNET => ("0x751A0bC0e3f75b38e01Cf25bFCE7fF36DE1C87DE", 12871780),
+                MAINNET_FORK => ("0x751A0bC0e3f75b38e01Cf25bFCE7fF36DE1C87DE", 12871780),
                 ARBITRUM_ONE => ("0x142B9666a0a3A30477b052962ddA81547E7029ab", 222870),
                 POLYGON => ("0x751A0bC0e3f75b38e01Cf25bFCE7fF36DE1C87DE", 17116402),
             ]),
@@ -175,6 +182,7 @@ fn build_module() -> Module {
             Contract::new("BalancerV2NoProtocolFeeLiquidityBootstrappingPoolFactory")
                 .with_networks(networks![
                     MAINNET => ("0x0F3e0c4218b7b0108a3643cFe9D3ec0d4F57c54e", 13730248),
+                    MAINNET_FORK => ("0x0F3e0c4218b7b0108a3643cFe9D3ec0d4F57c54e", 13730248),
                     GNOSIS => ("0x85a80afee867aDf27B50BdB7b76DA70f1E853062", 25415236),
                     SEPOLIA => ("0x45fFd460cC6642B8D8Fb12373DFd77Ceb0f4932B", 3419649),
                     ARBITRUM_ONE => ("0x1802953277FD955f9a254B80Aa0582f193cF1d77", 4859669),
@@ -188,6 +196,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2ComposableStablePoolFactory").with_networks(networks![
                 MAINNET => ("0xf9ac7B9dF2b3454E841110CcE5550bD5AC6f875F", 15485885),
+                MAINNET_FORK => ("0xf9ac7B9dF2b3454E841110CcE5550bD5AC6f875F", 15485885),
                 ARBITRUM_ONE => ("0xaEb406b0E430BF5Ea2Dc0B9Fe62E4E53f74B3a33", 23227044),
                 BNB => ("0xf302f9F50958c5593770FDf4d4812309fF77414f", 22691193),
                 OPTIMISM => ("0xf145caFB67081895EE80eB7c04A30Cf87f07b745", 22182522),
@@ -197,6 +206,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2ComposableStablePoolFactoryV3").with_networks(networks![
                 MAINNET => ("0xdba127fBc23fb20F5929C546af220A991b5C6e01", 16580899),
+                MAINNET_FORK => ("0xdba127fBc23fb20F5929C546af220A991b5C6e01", 16580899),
                 GNOSIS => ("0xC128468b7Ce63eA702C1f104D55A2566b13D3ABD", 26365805),
                 ARBITRUM_ONE => ("0x1c99324EDC771c82A0DCCB780CC7DDA0045E50e7", 58948370),
                 BNB => ("0xacAaC3e6D6Df918Bf3c809DFC7d42de0e4a72d4C", 25475700),
@@ -207,6 +217,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2ComposableStablePoolFactoryV4").with_networks(networks![
                 MAINNET => ("0xfADa0f4547AB2de89D1304A668C39B3E09Aa7c76", 16878679),
+                MAINNET_FORK => ("0xfADa0f4547AB2de89D1304A668C39B3E09Aa7c76", 16878679),
                 GNOSIS => ("0xD87F44Df0159DC78029AB9CA7D7e57E7249F5ACD", 27056416),
                 SEPOLIA => ("0xA3fd20E29358c056B727657E83DFd139abBC9924", 3425277),
                 ARBITRUM_ONE => ("0x2498A2B0d6462d2260EAC50aE1C3e03F4829BA95", 72235860),
@@ -219,6 +230,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2ComposableStablePoolFactoryV5").with_networks(networks![
                 MAINNET => ("0xDB8d758BCb971e482B2C45f7F8a7740283A1bd3A", 17672478),
+                MAINNET_FORK => ("0xDB8d758BCb971e482B2C45f7F8a7740283A1bd3A", 17672478),
                 GNOSIS => ("0x4bdCc2fb18AEb9e2d281b0278D946445070EAda7", 28900564),
                 SEPOLIA => ("0xa523f47A933D5020b23629dDf689695AA94612Dc", 3872211),
                 ARBITRUM_ONE => ("0xA8920455934Da4D853faac1f94Fe7bEf72943eF1", 110212282),
@@ -232,6 +244,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV2ComposableStablePoolFactoryV6").with_networks(networks![
                 MAINNET => ("0x5B42eC6D40f7B7965BE5308c70e2603c0281C1E9", 19314764),
+                MAINNET_FORK => ("0x5B42eC6D40f7B7965BE5308c70e2603c0281C1E9", 19314764),
                 GNOSIS => ("0x47B489bf5836f83ABD928C316F8e39bC0587B020", 32650879),
                 SEPOLIA => ("0x05503B3aDE04aCA81c8D6F88eCB73Ba156982D2B", 5369821),
                 ARBITRUM_ONE => ("0x4bdCc2fb18AEb9e2d281b0278D946445070EAda7", 184805448),
@@ -244,6 +257,7 @@ fn build_module() -> Module {
         )
         .add_contract(Contract::new("BalancerV2Vault").with_networks(networks![
             MAINNET => ("0xBA12222222228d8Ba445958a75a0704d566BF2C8", 12272146),
+            MAINNET_FORK => ("0xBA12222222228d8Ba445958a75a0704d566BF2C8", 12272146),
             GNOSIS => ("0xBA12222222228d8Ba445958a75a0704d566BF2C8", 24821598),
             SEPOLIA => ("0xBA12222222228d8Ba445958a75a0704d566BF2C8", 3418831),
             ARBITRUM_ONE => ("0xBA12222222228d8Ba445958a75a0704d566BF2C8", 222832),
@@ -257,6 +271,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("BalancerV3BatchRouter").with_networks(networks![
                 MAINNET => ("0x136f1EFcC3f8f88516B9E94110D56FDBfB1778d1", 21339510),
+                MAINNET_FORK => ("0x136f1EFcC3f8f88516B9E94110D56FDBfB1778d1", 21339510),
                 GNOSIS => ("0xe2fa4e1d17725e72dcdAfe943Ecf45dF4B9E285b", 37377506),
                 SEPOLIA => ("0xC85b652685567C1B074e8c0D4389f83a2E458b1C", 7219301),
                 ARBITRUM_ONE => ("0xaD89051bEd8d96f045E8912aE1672c6C0bF8a85E", 297828544),
@@ -275,12 +290,14 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("PancakeRouter").with_networks(networks![
             MAINNET => "0xEfF92A263d31888d860bD50809A8D171709b7b1c",
+            MAINNET_FORK => "0xEfF92A263d31888d860bD50809A8D171709b7b1c",
             ARBITRUM_ONE => "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",
             BASE => "0x8cFe327CEc66d1C090Dd72bd0FF11d690C33a2Eb",
             BNB => "0x10ED43C718714eb63d5aA57B78B54704E256024E",
         ]))
         .add_contract(Contract::new("SushiSwapRouter").with_networks(networks![
             MAINNET => "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",
+            MAINNET_FORK => "0xd9e1ce17f2641f24ae83637ab66a2cca9c378b9f",
             GNOSIS => "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506",
             ARBITRUM_ONE => "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506",
             BASE => "0x6bded42c6da8fbf0d2ba55b2fa120c5e0c8d7891",
@@ -291,6 +308,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("SwaprRouter").with_networks(networks![
             MAINNET => "0xb9960d9bca016e9748be75dd52f02188b9d0829f",
+            MAINNET_FORK => "0xb9960d9bca016e9748be75dd52f02188b9d0829f",
             GNOSIS => "0xE43e60736b1cb4a75ad25240E2f9a62Bff65c0C0",
             ARBITRUM_ONE => "0x530476d5583724A89c8841eB6Da76E7Af4C0F17E",
         ]))
@@ -302,6 +320,7 @@ fn build_module() -> Module {
         )
         .add_contract(Contract::new("UniswapV2Factory").with_networks(networks![
             MAINNET => "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
+            MAINNET_FORK => "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f",
             GNOSIS => "0xA818b4F111Ccac7AA31D0BCc0806d64F2E0737D7",
             ARBITRUM_ONE => "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9",
             BASE => "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
@@ -313,6 +332,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("UniswapV2Router02").with_networks(networks![
             MAINNET => "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+            MAINNET_FORK => "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
             // GNOSIS: Uniswap V2 is not officially deployed on Gnosis. Use HoneyswapRouter (with custom init hash) instead.
             ARBITRUM_ONE => "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
             BASE => "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
@@ -327,6 +347,7 @@ fn build_module() -> Module {
         .add_contract(Contract::new("UniswapV3Pool"))
         .add_contract(Contract::new("UniswapV3QuoterV2").with_networks(networks![
             MAINNET => "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+            MAINNET_FORK => "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
             GNOSIS => "0x7E9cB3499A6cee3baBe5c8a3D328EA7FD36578f4",
             ARBITRUM_ONE => "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
             BASE => "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
@@ -342,6 +363,7 @@ fn build_module() -> Module {
             Contract::new("UniswapV3SwapRouterV2").with_networks(networks![
                 ARBITRUM_ONE => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
                 MAINNET => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+                MAINNET_FORK => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
                 GNOSIS => "0xc6D25285D5C5b62b7ca26D6092751A145D50e9Be",
                 POLYGON => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
                 OPTIMISM => "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
@@ -355,6 +377,7 @@ fn build_module() -> Module {
         )
         .add_contract(Contract::new("IUniswapV3Factory").with_networks(networks![
             MAINNET => "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            MAINNET_FORK => "0x1F98431c8aD98523631AE4a59f267346ea31F984",
             GNOSIS => "0xe32F7dD7e3f098D518ff19A22d5f028e076489B1",
             SEPOLIA => "0x1F98431c8aD98523631AE4a59f267346ea31F984",
             ARBITRUM_ONE => "0x1F98431c8aD98523631AE4a59f267346ea31F984",
@@ -369,6 +392,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("HooksTrampoline").with_networks(networks![
             MAINNET => "0x60Bf78233f48eC42eE3F101b9a05eC7878728006",
+            MAINNET_FORK => "0x60Bf78233f48eC42eE3F101b9a05eC7878728006",
             GNOSIS => "0x01DcB88678aedD0C4cC9552B20F4718550250574",
             SEPOLIA => "0x60Bf78233f48eC42eE3F101b9a05eC7878728006",
             ARBITRUM_ONE => "0x60Bf78233f48eC42eE3F101b9a05eC7878728006",
@@ -383,6 +407,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("CoWSwapEthFlow").with_networks(networks![
             MAINNET => ("0x40a50cf069e992aa4536211b23f286ef88752187", 16169866),
+            MAINNET_FORK => ("0x40a50cf069e992aa4536211b23f286ef88752187", 16169866),
             GNOSIS => ("0x40a50cf069e992aa4536211b23f286ef88752187", 25414331),
             SEPOLIA => ("0x0b7795E18767259CC253a2dF471db34c72B49516", 4718739),
             ARBITRUM_ONE => ("0x6DFE75B5ddce1ADE279D4fa6BD6AeF3cBb6f49dB", 204747458),
@@ -398,6 +423,7 @@ fn build_module() -> Module {
         .add_contract(Contract::new("ERC1271SignatureValidator"))
         .add_contract(Contract::new("BalancerQueries").with_networks(networks![
             MAINNET => ("0xE39B5e3B6D74016b2F6A9673D7d7493B6DF549d5", 15188261),
+            MAINNET_FORK => ("0xE39B5e3B6D74016b2F6A9673D7d7493B6DF549d5", 15188261),
             ARBITRUM_ONE => ("0xE39B5e3B6D74016b2F6A9673D7d7493B6DF549d5", 18238624),
             OPTIMISM => ("0xE39B5e3B6D74016b2F6A9673D7d7493B6DF549d5", 15288107),
             BASE => ("0x300Ab2038EAc391f26D9F895dc61F8F66a548833", 1205869),
@@ -408,11 +434,13 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("LiquoriceSettlement").with_networks(networks![
                 MAINNET => "0x0448633eb8B0A42EfED924C42069E0DcF08fb552",
+                MAINNET_FORK => "0x0448633eb8B0A42EfED924C42069E0DcF08fb552",
                 ARBITRUM_ONE => "0x0448633eb8B0A42EfED924C42069E0DcF08fb552",
             ]),
         )
         .add_contract(Contract::new("FlashLoanRouter").with_networks(networks![
             MAINNET => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
+            MAINNET_FORK => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
             GNOSIS => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
             SEPOLIA => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
             ARBITRUM_ONE => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
@@ -429,6 +457,7 @@ fn build_module() -> Module {
         .add_contract(Contract::new("ICowWrapper"))
         .add_contract(Contract::new("ChainalysisOracle").with_networks(networks![
             MAINNET => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
+            MAINNET_FORK => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
             ARBITRUM_ONE => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
             BASE => "0x3A91A31cB3dC49b4db9Ce721F50a9D076c8D739B",
             AVALANCHE => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
@@ -438,6 +467,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("Permit2").with_networks(networks![
             MAINNET => ("0x000000000022D473030F116dDEE9F6B43aC78BA3", 15986406),
+            MAINNET_FORK => ("0x000000000022D473030F116dDEE9F6B43aC78BA3", 15986406),
             GNOSIS => ("0x000000000022D473030F116dDEE9F6B43aC78BA3", 27338672),
             SEPOLIA => ("0x000000000022D473030F116dDEE9F6B43aC78BA3", 2356287),
             ARBITRUM_ONE => ("0x000000000022D473030F116dDEE9F6B43aC78BA3", 38692735),
@@ -452,6 +482,7 @@ fn build_module() -> Module {
         .add_contract(
             Contract::new("GPv2AllowListAuthentication").with_networks(networks![
                 MAINNET => ("0x2c4c28DDBdAc9C5E7055b4C863b72eA0149D8aFE", 12593263),
+                MAINNET_FORK => ("0x2c4c28DDBdAc9C5E7055b4C863b72eA0149D8aFE", 12593263),
                 GNOSIS => ("0x2c4c28DDBdAc9C5E7055b4C863b72eA0149D8aFE", 16465099),
                 SEPOLIA => ("0x2c4c28DDBdAc9C5E7055b4C863b72eA0149D8aFE", 4717469),
                 ARBITRUM_ONE => ("0x2c4c28DDBdAc9C5E7055b4C863b72eA0149D8aFE", 204702129),
@@ -467,6 +498,7 @@ fn build_module() -> Module {
         )
         .add_contract(Contract::new("GPv2Settlement").with_networks(networks![
             MAINNET => ("0x9008D19f58AAbD9eD0D60971565AA8510560ab41", 12593265),
+            MAINNET_FORK => ("0x9008D19f58AAbD9eD0D60971565AA8510560ab41", 12593265),
             GNOSIS => ("0x9008D19f58AAbD9eD0D60971565AA8510560ab41", 16465100),
             SEPOLIA => ("0x9008D19f58AAbD9eD0D60971565AA8510560ab41", 4717488),
             ARBITRUM_ONE => ("0x9008D19f58AAbD9eD0D60971565AA8510560ab41", 204704802),
@@ -481,6 +513,7 @@ fn build_module() -> Module {
         ]))
         .add_contract(Contract::new("WETH9").with_networks(networks![
             MAINNET => "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            MAINNET_FORK => "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
             GNOSIS => "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
             SEPOLIA => "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
             ARBITRUM_ONE => "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
@@ -499,12 +532,14 @@ fn build_module() -> Module {
                 .add_contract(Contract::new("CowAmmConstantProductFactory").with_networks(
                     networks![
                         MAINNET => ("0x40664207e3375FB4b733d4743CE9b159331fd034", 19861952),
+                        MAINNET_FORK => ("0x40664207e3375FB4b733d4743CE9b159331fd034", 19861952),
                         GNOSIS => ("0xdb1cba3a87f2db53b6e1e6af48e28ed877592ec0", 33874317),
                         SEPOLIA => ("0xb808e8183e3a72d196457d127c7fd4befa0d7fd3", 5874562),
                     ],
                 ))
                 .add_contract(Contract::new("CowAmmLegacyHelper").with_networks(networks![
                     MAINNET => ("0x3705ceee5eaa561e3157cf92641ce28c45a3999c", 20332745),
+                    MAINNET_FORK => ("0x3705ceee5eaa561e3157cf92641ce28c45a3999c", 20332745),
                     GNOSIS => ("0xd9ec06b001957498ab1bc716145515d1d0e30ffb", 35026999),
                 ]))
                 .add_contract(Contract::new("CowAmmUniswapV2PriceOracle"))
@@ -517,6 +552,7 @@ fn build_module() -> Module {
                 .add_contract(Contract::new("MockERC4626Wrapper"))
                 .add_contract(Contract::new("CowProtocolToken").with_networks(networks![
                     MAINNET => "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
+                    MAINNET_FORK => "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
                     GNOSIS => "0x177127622c4A00F3d409B75571e12cB3c8973d3c",
                     SEPOLIA => "0x0625aFB445C3B6B7B929342a04A22599fd5dBB59",
                     ARBITRUM_ONE => "0xcb8b5CD20BdCaea9a010aC1F8d835824F5C87A04",
@@ -533,6 +569,7 @@ fn build_module() -> Module {
                 .add_contract(Contract::new("Swapper"))
                 .add_contract(Contract::new("Signatures").with_networks(networks![
                     MAINNET => "0x8262d639c38470F38d2eff15926F7071c28057Af",
+                    MAINNET_FORK => "0x8262d639c38470F38d2eff15926F7071c28057Af",
                     ARBITRUM_ONE => "0x8262d639c38470F38d2eff15926F7071c28057Af",
                     BASE => "0x8262d639c38470F38d2eff15926F7071c28057Af",
                     AVALANCHE => "0x8262d639c38470F38d2eff15926F7071c28057Af",
@@ -547,6 +584,7 @@ fn build_module() -> Module {
                 ]))
                 .add_contract(Contract::new("Balances").with_networks(networks![
                     MAINNET => "0x88b4B74082BffB2976C306CB3f7E9093AE48B94F",
+                    MAINNET_FORK => "0x88b4B74082BffB2976C306CB3f7E9093AE48B94F",
                     ARBITRUM_ONE => "0x88b4B74082BffB2976C306CB3f7E9093AE48B94F",
                     BASE => "0x88b4B74082BffB2976C306CB3f7E9093AE48B94F",
                     AVALANCHE => "0x88b4B74082BffB2976C306CB3f7E9093AE48B94F",
