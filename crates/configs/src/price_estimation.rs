@@ -1,5 +1,5 @@
 use {
-    crate::{balance_overrides, rate_limit::Strategy},
+    crate::rate_limit::Strategy,
     alloy::primitives::{Address, U256, map::HashSet},
     bigdecimal::BigDecimal,
     serde::Deserialize,
@@ -214,7 +214,7 @@ const fn default_probing_depth() -> u8 {
     60
 }
 
-const fn default_cache_size() -> usize {
+const fn default_cache_size() -> u64 {
     1000
 }
 
@@ -226,17 +226,6 @@ fn default_detection_timeout() -> Duration {
 #[cfg_attr(any(test, feature = "test-util"), derive(serde::Serialize))]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct BalanceOverridesConfig {
-    /// Token configuration for simulated balances on verified quotes. This
-    /// allows the quote verification system to produce verified quotes for
-    /// traders without sufficient balance for the configured token pairs.
-    #[serde(default)]
-    pub token_overrides: balance_overrides::TokenConfiguration,
-
-    /// Enable automatic detection of token balance overrides. Pre-configured
-    /// values in `token_overrides` take precedence.
-    #[serde(default)]
-    pub autodetect: bool,
-
     /// Controls how many storage slots get probed per storage entry point
     /// for automatically detecting how to override the balances of a token.
     #[serde(default = "default_probing_depth")]
@@ -245,7 +234,7 @@ pub struct BalanceOverridesConfig {
     /// Controls for how many tokens we store the result of the automatic
     /// balance override detection before evicting less used entries.
     #[serde(default = "default_cache_size")]
-    pub cache_size: usize,
+    pub cache_size: u64,
 
     /// Maximum time to wait for each balance override strategy verification
     /// before giving up. Some tokens (e.g. reflection tokens) can cause the
@@ -258,8 +247,6 @@ pub struct BalanceOverridesConfig {
 impl Default for BalanceOverridesConfig {
     fn default() -> Self {
         Self {
-            token_overrides: Default::default(),
-            autodetect: false,
             probing_depth: default_probing_depth(),
             cache_size: default_cache_size(),
             detection_timeout: default_detection_timeout(),
@@ -326,7 +313,6 @@ mod tests {
             QuoteVerificationMode::Unverified
         ));
         assert_eq!(config.quote_timeout, Duration::from_secs(5));
-        assert!(!config.balance_overrides.autodetect);
         assert_eq!(config.balance_overrides.probing_depth, 60);
         assert_eq!(config.balance_overrides.cache_size, 1000);
         assert!(config.tokens_without_verification.is_empty());
@@ -369,7 +355,6 @@ mod tests {
         broadcast-channel-capacity = 100
 
         [balance-overrides]
-        autodetect = true
         probing-depth = 30
         cache-size = 500
         "#;
@@ -403,7 +388,6 @@ mod tests {
         ));
         assert_eq!(config.quote_timeout, Duration::from_secs(10));
         assert_eq!(config.max_quote_timeout, Duration::from_secs(20));
-        assert!(config.balance_overrides.autodetect);
         assert_eq!(config.balance_overrides.probing_depth, 30);
         assert_eq!(config.balance_overrides.cache_size, 500);
         assert_eq!(config.tokens_without_verification.len(), 1);

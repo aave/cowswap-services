@@ -333,7 +333,7 @@ fn build_module() -> Module {
         .add_contract(Contract::new("UniswapV2Router02").with_networks(networks![
             MAINNET => "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
             MAINNET_FORK => "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
-            GNOSIS => "0x1C232F01118CB8B424793ae03F870aa7D0ac7f77",
+            // GNOSIS: Uniswap V2 is not officially deployed on Gnosis. Use HoneyswapRouter (with custom init hash) instead.
             ARBITRUM_ONE => "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
             BASE => "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
             SEPOLIA => "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3",
@@ -453,7 +453,7 @@ fn build_module() -> Module {
             PLASMA => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
             INK => "0x9da8b48441583a2b93e2ef8213aad0ec0b392c69",
         ]))
-        .add_contract(Contract::new("CowSettlementForwarder"))
+        .add_contract(Contract::new("Solver7702Delegate"))
         .add_contract(Contract::new("ICowWrapper"))
         .add_contract(Contract::new("ChainalysisOracle").with_networks(networks![
             MAINNET => "0x40C57923924B5c5c5455c48D93317139ADDaC8fb",
@@ -566,7 +566,6 @@ fn build_module() -> Module {
                 .add_contract(Contract::new("AnyoneAuthenticator"))
                 .add_contract(Contract::new("Solver"))
                 .add_contract(Contract::new("Spardose"))
-                .add_contract(Contract::new("Trader"))
                 .add_contract(Contract::new("Swapper"))
                 .add_contract(Contract::new("Signatures").with_networks(networks![
                     MAINNET => "0x8262d639c38470F38d2eff15926F7071c28057Af",

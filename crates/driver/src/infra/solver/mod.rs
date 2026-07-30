@@ -27,6 +27,7 @@ use {
         signers::{Signature, aws::AwsSigner, local::PrivateKeySigner},
     },
     anyhow::Result,
+    bytes::Bytes,
     derive_more::{From, Into},
     eth_domain_types as eth,
     num::BigRational,
@@ -34,6 +35,7 @@ use {
     reqwest::header::HeaderName,
     std::{
         collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
         time::{Duration, Instant},
     },
     thiserror::Error,
@@ -214,18 +216,50 @@ pub struct Config {
     pub haircut_bps: u32,
     /// Additional EOAs for parallel settlement submission via EIP-7702.
     /// When non-empty, these accounts submit txs to the solver EOA (which
-    /// delegates to a forwarder contract), enabling concurrent submissions.
+    /// delegates to Solver7702Delegate), enabling concurrent submissions.
     pub submission_accounts: Vec<Account>,
-    /// Address of the deployed CowSettlementForwarder contract for EIP-7702
-    /// delegation. Required when `submission_accounts` is non-empty.
-    pub forwarder_contract: Option<eth::Address>,
     /// Maximum number of solutions the driver proposes to the autopilot per
     /// auction. When 1 (the default), only the best-scoring solution is sent.
     pub max_solutions_to_propose: std::num::NonZeroUsize,
+    /// How many solutions the driver is allowed to post-process concurrently.
+    pub post_processing_concurrency_limit: std::num::NonZeroUsize,
+}
+
+impl Config {
+    fn validate(&self) -> Result<()> {
+        if self.submission_accounts.is_empty() {
+            anyhow::ensure!(
+                self.max_solutions_to_propose.get() == 1,
+                "solver '{}': max-solutions-to-propose > 1 requires non-empty submission-accounts \
+                 (EIP-7702 parallel submission must be enabled)",
+                self.name,
+            );
+            return Ok(());
+        }
+
+        anyhow::ensure!(
+            self.submission_accounts
+                .iter()
+                .all(|account| !matches!(account, Account::Address(_))),
+            "solver '{}': EIP-7702 submission accounts must be signers; address-only accounts \
+             cannot sign delegated settlement transactions",
+            self.name,
+        );
+        anyhow::ensure!(
+            !matches!(self.account, Account::Address(_)),
+            "solver '{}': main account must be a signer to set up EIP-7702 delegation when \
+             submission accounts are configured",
+            self.name,
+        );
+
+        Ok(())
+    }
 }
 
 impl Solver {
     pub async fn try_new(config: Config, eth: Ethereum) -> Result<Self> {
+        config.validate()?;
+
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -323,11 +357,6 @@ impl Solver {
         &self.config.submission_accounts
     }
 
-    /// Address of the CowSettlementForwarder contract for EIP-7702 delegation.
-    pub fn forwarder_contract(&self) -> Option<eth::Address> {
-        self.config.forwarder_contract
-    }
-
     pub fn max_solutions_to_propose(&self) -> usize {
         self.config.max_solutions_to_propose.get()
     }
@@ -347,6 +376,7 @@ impl Solver {
 
         // Fetch the solutions from the solver.
         let weth = self.eth.contracts().weth_address();
+
         let auction_dto = dto::auction::new(
             auction,
             liquidity,
@@ -356,21 +386,15 @@ impl Solver {
             &flashloan_hints,
             &wrappers,
             auction.deadline(self.timeouts()).solvers(),
+            self.config.haircut_bps,
         );
 
-        let body = {
-            // pre-allocate a big enough buffer to avoid re-allocating memory
-            // as the request gets serialized
-            const BYTES_PER_ORDER: usize = 1_300;
-            let mut buffer = Vec::with_capacity(auction.orders().len() * BYTES_PER_ORDER);
-            serde_json::to_writer(&mut buffer, &auction_dto).unwrap();
-            String::from_utf8(buffer).expect("serde_json only writes valid utf8")
-        };
+        let body = serialize_body(auction_dto);
 
         if let Some(id) = auction.id() {
             // Only auctions with IDs are real auctions (/quote requests don't have an ID).
             // Only for those it makes sense to archive them and measure the execution time.
-            self.persistence.archive_auction(id, &auction_dto);
+            self.persistence.archive_auction(id, body.clone());
             ::observe::metrics::metrics().measure_auction_overhead(
                 start,
                 "driver",
@@ -516,6 +540,142 @@ impl Solver {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+}
+
+/// Serializes the request body in a way that avoid re-allocating while not
+/// overallocating a lot of memory. It does that by keeping track of the biggest
+/// request seen for each kind of request (quote with/without liquidity, full
+/// auction with/without liquidity) and allocating the correct amount of memory
+/// based on the data in the auction.
+fn serialize_body(auction_dto: solvers_dto::auction::Auction) -> Bytes {
+    // these values store the biggest allocation we needed for each
+    // category of requests
+    static QUOTE_WITH_LIQUIDITY: AtomicUsize = AtomicUsize::new(1_000);
+    static QUOTE_WITHOUT_LIQUIDITY: AtomicUsize = AtomicUsize::new(1_000);
+    static AUCTION_WITH_LIQUIDITY: AtomicUsize = AtomicUsize::new(1_000);
+    static AUCTION_WITHOUT_LIQUIDITY: AtomicUsize = AtomicUsize::new(1_000);
+
+    // based on the "shape" of the auction we pick the allocation size
+    let is_auction = auction_dto.id.is_some();
+    let with_liquidity = !auction_dto.liquidity.is_empty();
+    let memory_target = match (is_auction, with_liquidity) {
+        (false, false) => &QUOTE_WITHOUT_LIQUIDITY,
+        (false, true) => &QUOTE_WITH_LIQUIDITY,
+        (true, false) => &AUCTION_WITHOUT_LIQUIDITY,
+        (true, true) => &AUCTION_WITH_LIQUIDITY,
+    };
+
+    // pre-allocate biggest request size + 0.5% (to avoid re-allocations when
+    // the request grows only slightly)
+    let pre_alloc_size = memory_target.load(Ordering::Relaxed);
+    let pre_alloc_size = pre_alloc_size + pre_alloc_size * 5 / 1_000;
+    let mut buffer = Vec::with_capacity(pre_alloc_size);
+
+    serde_json::to_writer(&mut buffer, &auction_dto).unwrap();
+
+    // now that we know how much memory was actually needed we update the memory
+    // targets
+    memory_target.fetch_max(buffer.len(), Ordering::Relaxed);
+    tracing::trace!(pre_alloc_size, final_size = buffer.len(), "body allocation");
+
+    Bytes::from(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        alloy::primitives::{address, b256},
+        std::num::NonZeroUsize,
+    };
+
+    const SOLVER: Address = address!("0000000000000000000000000000000000000001");
+    const SUBMITTER: Address = address!("0000000000000000000000000000000000000002");
+
+    fn signer() -> Account {
+        Account::PrivateKey(
+            PrivateKeySigner::from_bytes(&b256!(
+                "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+            ))
+            .unwrap(),
+        )
+    }
+
+    fn config() -> Config {
+        Config {
+            endpoint: "http://localhost/solve".parse().unwrap(),
+            name: Name("solver".to_string()),
+            slippage: Slippage {
+                relative: BigRational::from_integer(0.into()),
+                absolute: None,
+            },
+            liquidity: Liquidity::Fetch,
+            account: Account::Address(SOLVER),
+            timeouts: Timeouts {
+                http_delay: chrono::Duration::seconds(1),
+                solving_share_of_deadline: 1.0.try_into().unwrap(),
+            },
+            request_headers: Default::default(),
+            fee_handler: FeeHandler::Driver,
+            quote_using_limit_orders: false,
+            merge_solutions: SolutionMerging::Forbidden,
+            s3: None,
+            solver_native_token: ManageNativeToken {
+                wrap_address: false,
+                insert_unwraps: false,
+            },
+            quote_tx_origin: None,
+            response_size_limit_max_bytes: 1024,
+            bad_order_detection: BadOrderDetection {
+                tokens_supported: Default::default(),
+                enable_simulation_strategy: false,
+                enable_metrics_strategy: false,
+                metrics_strategy_failure_ratio: 0.9,
+                metrics_strategy_required_measurements: 20,
+                metrics_strategy_log_only: true,
+                metrics_strategy_order_freeze_time: Duration::ZERO,
+                metrics_strategy_cache_gc_interval: Duration::ZERO,
+                metrics_strategy_cache_max_age: Duration::ZERO,
+            },
+            settle_queue_size: 0,
+            flashloans_enabled: false,
+            fetch_liquidity_at_block: infra::liquidity::AtBlock::Latest,
+            haircut_bps: 0,
+            submission_accounts: vec![],
+            max_solutions_to_propose: NonZeroUsize::new(1).unwrap(),
+            post_processing_concurrency_limit: NonZeroUsize::MAX,
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_proposed_solutions_without_submission_accounts() {
+        let mut config = config();
+        config.max_solutions_to_propose = NonZeroUsize::new(2).unwrap();
+
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("requires non-empty"));
+    }
+
+    #[test]
+    fn rejects_read_only_submission_accounts() {
+        let mut config = config();
+        config.submission_accounts = vec![Account::Address(SUBMITTER)];
+
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("must be signers"));
+    }
+
+    #[test]
+    fn rejects_read_only_main_account_with_submission_accounts() {
+        let mut config = config();
+        config.submission_accounts = vec![signer()];
+
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("main account must be a signer"));
     }
 }
 

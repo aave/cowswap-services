@@ -1,13 +1,13 @@
 # CoW Protocol Order Debug Skill
 
-Debug why CoW Protocol orders fail to match. Requires DB access + Victoria Logs access (via CoW-Prod MCP).
+Debug why CoW Protocol orders fail to match. Requires DB access + Victoria Logs access (via Grafana).
 
 ## Quick Checklist
 
 Run through these in order:
 
 1. [ ] **Order status** — Check API status first (cancelled/expired/fulfilled/open)
-2. [ ] **User cancellation** — If cancelled, search logs for `"order cancelled" AND all:ORDER_UID` FIRST
+2. [ ] **User cancellation** — If cancelled, search logs for `order cancelled all:ORDER_UID` FIRST
 3. [ ] **Order in auction** — Was order in autopilot auction? When?
 4. [ ] **Solver bids** — Did any solver bid? What happened to their solution?
 5. [ ] **Settlement outcome** — Did settlement succeed/fail/timeout?
@@ -81,54 +81,43 @@ cast call $SETTLEMENT_CONTRACT "preSignature(bytes)" $ORDER_UID --rpc-url $RPC
 
 ---
 
-## 3. Check Logs (Victoria Logs via MCP)
+## 3. Check Logs (Victoria Logs via Grafana)
 
-Logs are stored in Victoria Logs and accessible via the `CoW-Prod` MCP tools. Use `mcp__CoW-Prod__victorialogs_query` for log searches. Timestamps must be RFC3339 format (compute from current date).
+Logs are stored in Victoria Logs and accessible via Grafana API.
 
-**IMPORTANT — Protect context window**: Always append `| fields _time, _msg, all` to queries to strip kubernetes/ec2 metadata (~4KB per entry). Use small `limit` values (10-20). When you only need specific fields, use `| fields _time, _msg, parsed.fields.err, parsed.fields.driver` etc.
+**Query using `scripts/vlogs`:**
+```bash
+scripts/vlogs "NOT container:controller all:ORDER_UID"
 
-**Example queries (use `victorialogs_query` tool):**
+scripts/vlogs "NOT container:controller network:bnb all:ORDER_UID"
+
+scripts/vlogs "NOT container:controller all:22788649"
+
+scripts/vlogs "NOT container:controller baseline all:22788649"
+
+scripts/vlogs "NOT container:controller all:ORDER_UID" --from now-24h --max 200
+
+scripts/vlogs "NOT container:controller all:ORDER_UID" --raw
 ```
-# All order logs (exclude nginx controller, filter by network, strip metadata)
-query: "container:!controller AND network:$NETWORK AND all:ORDER_UID | fields _time, _msg, all"
-start: "<24h-ago-RFC3339>"
-limit: 20
 
-# Search by quote ID
-query: "container:!controller AND network:$NETWORK AND all:22788649 | fields _time, _msg, all"
-
-# Search specific solver
-query: "container:!controller AND network:$NETWORK AND baseline AND all:22788649 | fields _time, _msg, all"
-```
-
-**Useful filters (part of the LogsQL expression):**
-- `container:!controller` — excludes nginx access logs (REQUIRED for order UID searches)
-- `network:$NETWORK` — **always include when debugging an order** to filter by chain (mainnet, bnb, arbitrum-one, base, etc). Reduces noise and speeds up queries.
-- `all:` — prefix for searching structured fields (order UIDs, auction IDs, quote IDs). Without a field prefix, Victoria Logs only searches the log message text, not structured fields. You can also use `parsed.fields.order_uid:0x...` for precise matching, but `all:` works universally.
-- `| fields _time, _msg, all` — **always append** to strip k8s metadata and protect context window
+**Useful filters (part of the expr):**
+- `NOT container:controller` — excludes nginx access logs (REQUIRED for order UID searches)
+- `network:$NETWORK` — filter by chain (mainnet, bnb, arbitrum-one, base, etc)
+- `all:` — prefix for searching structured fields (order UIDs, auction IDs, quote IDs). Without a field prefix, Victoria Logs only searches the log message text, not structured fields. You can also use specific field names (e.g., `order_uid:0x...`) but `all:` works universally.
 
 **Note:** Always use the **full order UID with 0x prefix** and the `all:` field prefix for reliable matching.
 
-**IMPORTANT - Run targeted lifecycle queries in parallel** (use FULL order UID with 0x). Call multiple `victorialogs_query` MCP tools simultaneously. Always include `network:$NETWORK` and `| fields` pipe:
+**IMPORTANT - Run targeted lifecycle queries in parallel** (use FULL order UID with 0x):
 
-```
-# Order creation
-query: "container:!controller AND network:$NETWORK AND \"order created\" AND all:ORDER_UID | fields _time, _msg, all"
+```bash
+scripts/vlogs "NOT container:controller order created all:ORDER_UID"
+scripts/vlogs "NOT container:controller order cancelled all:ORDER_UID"
+scripts/vlogs "NOT container:controller proposed solution all:ORDER_UID"
+scripts/vlogs "NOT container:controller settlement failed all:ORDER_UID"
+scripts/vlogs "NOT container:controller filtered all:ORDER_UID"
 
-# Order cancellation
-query: "container:!controller AND network:$NETWORK AND \"order cancelled\" AND all:ORDER_UID | fields _time, _msg, all"
-
-# Proposed solutions
-query: "container:!controller AND network:$NETWORK AND \"proposed solution\" AND all:ORDER_UID | fields _time, _msg, all"
-
-# Settlement failures (use specific parsed fields for concise output)
-query: "container:!controller AND network:$NETWORK AND \"settlement failed\" AND all:ORDER_UID | fields _time, _msg, parsed.fields.err, parsed.fields.driver, parsed.spans.auction.auction_id"
-
-# Filtering
-query: "container:!controller AND network:$NETWORK AND filtered AND all:ORDER_UID | fields _time, _msg, all"
-
-# Find discarded solutions (use order UID bytes without 0x prefix)
-query: "container:!controller AND network:$NETWORK AND discarded AND all:ORDER_UID_WITHOUT_0X | fields _time, _msg, all"
+# Find discarded solutions where order appears in calldata (use order UID bytes without 0x prefix)
+scripts/vlogs "discarded all:ORDER_UID_WITHOUT_0X"
 ```
 
 **What to look for:**
@@ -202,10 +191,10 @@ WHERE oq.order_uid = '\x$ORDER_UID_HEX';
 ```
 
 ### Method 3: Logs (fallback)
-Find the quote_id from the "order created" log using `victorialogs_query`:
+Find the quote_id from the "order created" log:
 
-```
-query: "container:!controller AND network:$NETWORK AND \"order created\" AND all:ORDER_UID | fields _time, _msg, all"
+```bash
+scripts/vlogs "NOT container:controller order created all:ORDER_UID"
 ```
 
 **Example log line:**
@@ -214,8 +203,8 @@ orderbook::api::post_order: order created order_uid=0x... quote_id=Some(2720468)
 ```
 
 Then search for quote details by ID:
-```
-query: "container:!controller AND network:$NETWORK AND all:$QUOTE_ID | fields _time, _msg, all"
+```bash
+scripts/vlogs "NOT container:controller all:$QUOTE_ID"
 ```
 
 ---
@@ -308,13 +297,13 @@ surplusFeeTimestamp is within last 10 minutes
 ```
 
 **If missing/stale, check surplus fee computation logs:**
-```
-query: "network:$NETWORK AND surplus_fee AND all:ORDER_UID | fields _time, _msg, all"
+```bash
+scripts/vlogs "surplus_fee all:ORDER_UID"
 ```
 
 **Surplus fee error logs:**
-```
-query: "network:$NETWORK AND surplus_fee AND error | fields _time, _msg, all"
+```bash
+scripts/vlogs "surplus_fee error"
 ```
 
 ### 9.2 Auction Filtering Check
@@ -325,8 +314,8 @@ curl -s "https://api.cow.fi/$NETWORK/api/v1/auction" | jq '.orders[] | select(.u
 ```
 
 If not present, order is filtered. Check filter logs:
-```
-query: "network:$NETWORK AND filtered AND all:ORDER_UID | fields _time, _msg, all"
+```bash
+scripts/vlogs "filtered all:ORDER_UID"
 ```
 
 **Common filter reasons:**
@@ -414,13 +403,13 @@ settle(
 Order is in auction but still not matching?
 
 **Auction orders log:**
-```
-query: "network:$NETWORK AND all:$AUCTION_ID | fields _time, _msg, all"
+```bash
+scripts/vlogs "all:$AUCTION_ID"
 ```
 
 **Specific auction run:**
-```
-query: "network:$NETWORK AND all:$RUN_ID | fields _time, _msg, all"
+```bash
+scripts/vlogs "all:$RUN_ID"
 ```
 
 ### JIT Orders & CoW AMMs
@@ -571,7 +560,7 @@ curl -s "https://api.cow.fi/$NETWORK/api/v1/app_data/$APP_DATA_HASH"
 | Resource | URL |
 |----------|-----|
 | Order Explorer | `https://explorer.cow.fi/orders/$ORDER_UID` |
-| Victoria Logs | Via `CoW-Prod` MCP tools (`victorialogs_query`, etc.) |
+| Grafana Logs (Victoria Logs) | `$GRAFANA_URL/explore` (see .env.claude) |
 | API Docs | `https://api.cow.fi/docs/` |
 | Block-to-Date | `https://etherscan.io/blockdateconverter` |
 | Barn (Staging) | `https://barn.cow.fi` |

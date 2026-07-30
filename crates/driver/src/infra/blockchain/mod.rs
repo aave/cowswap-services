@@ -1,5 +1,9 @@
 use {
-    crate::{boundary, domain::blockchain::TxStatus},
+    crate::{
+        boundary,
+        domain::blockchain::TxStatus,
+        infra::{blockchain::gas::GasPriceParameters, config::file::GasEstimatorType},
+    },
     account_balances::{BalanceSimulator, SimulationError},
     alloy::{
         eips::eip1559::Eip1559Estimation,
@@ -8,7 +12,7 @@ use {
         rpc::types::{TransactionReceipt, TransactionRequest},
         transports::TransportErrorKind,
     },
-    balance_overrides::{BalanceOverrides, StateOverriding},
+    balance_overrides::{StateOverrides, StateOverriding},
     chain::Chain,
     eth_domain_types as eth,
     ethrpc::{Web3, alloy::ProviderLabelingExt, block_stream::CurrentBlockWatcher},
@@ -104,9 +108,10 @@ impl Ethereum {
     pub async fn new(
         rpc: Rpc,
         addresses: contracts::Addresses,
-        gas: Arc<GasPriceEstimator>,
         current_block_args: &shared::current_block::Arguments,
         tx_gas_limit: eth::Gas,
+        gas_estimator_type: &GasEstimatorType,
+        gas_adjustments: GasPriceParameters,
     ) -> Self {
         let Rpc { web3, chain, args } = rpc;
         let current_block_stream = current_block_args
@@ -114,15 +119,25 @@ impl Ethereum {
             .await
             .expect("couldn't initialize current block stream");
 
+        let gas = Arc::new(
+            GasPriceEstimator::new(
+                &web3.provider,
+                &current_block_stream,
+                gas_estimator_type,
+                gas_adjustments,
+            )
+            .await
+            .expect("initialize gas price estimator"),
+        );
+
         let contracts = Contracts::new(&web3, chain, addresses)
             .await
             .expect("could not initialize important smart contracts");
-        let state_overrider = Arc::new(BalanceOverrides::new(web3.clone()));
+        let state_overrider = Arc::new(StateOverrides::new(web3.clone()));
         let balance_simulator = BalanceSimulator::new(
             contracts.settlement().clone(),
             contracts.balance_helper().clone(),
             *contracts.vault_relayer(),
-            Some(*contracts.vault().address()),
             state_overrider.clone(),
         );
 
@@ -267,6 +282,50 @@ impl Ethereum {
                     }
                 }
             })
+            .map_err(Into::into)
+    }
+
+    /// The block our successful `Settlement` event for `tx_hash` landed in,
+    /// searching `[from_block, to_block]` inclusive, or `None` if it is not in
+    /// that range. Only a successful settle emits the event, and `eth_getLogs`
+    /// reads block logs even while the receipt-by-hash lookup still lags, so
+    /// this sees a freshly mined settlement that `eth_getTransactionReceipt`
+    /// would still miss. Scanning a range rather than a single block means a
+    /// block the (coalescing) block stream skipped on a fast chain is still
+    /// covered.
+    pub async fn successful_settlement_block(
+        &self,
+        tx_hash: eth::TxId,
+        from_block: u64,
+    ) -> Result<Option<eth::BlockNo>, Error> {
+        let logs = self
+            .contracts()
+            .settlement()
+            .event_filter::<::contracts::GPv2Settlement::GPv2Settlement::Settlement>()
+            .from_block(alloy::eips::BlockNumberOrTag::Number(from_block))
+            // `Latest` rather than the stream's head: the node may already be a block
+            // or two ahead, and querying up to its real tip narrows the race window.
+            .to_block(alloy::eips::BlockNumberOrTag::Latest)
+            .query()
+            .await?;
+        Ok(logs
+            .into_iter()
+            .find(|(_, log)| log.transaction_hash == Some(tx_hash.0))
+            .and_then(|(_, log)| log.block_number)
+            .map(eth::BlockNo))
+    }
+
+    /// The signer's transaction count including the mempool (the `pending`
+    /// tag). A count above the nonce we submitted with means our tx is
+    /// still queued in the mempool or has already mined (the count stays at
+    /// `nonce + 1` once it mines). A count equal to that nonce means the tx
+    /// left the mempool without mining.
+    pub async fn pending_transaction_count(&self, address: eth::Address) -> Result<u64, Error> {
+        self.web3
+            .provider
+            .get_transaction_count(address)
+            .pending()
+            .await
             .map_err(Into::into)
     }
 

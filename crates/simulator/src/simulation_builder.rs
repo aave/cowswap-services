@@ -1,14 +1,15 @@
 use {
-    crate::{encoding::WrapperCall, tenderly},
-    alloy_primitives::{Address, B256, Bytes, U256},
-    alloy_provider::{DynProvider, Provider},
+    crate::{encoding::WrapperCall, report, tenderly},
+    alloy_primitives::{Address, B256, Bytes, U256, address, b256, keccak256},
+    alloy_provider::{DynProvider, Provider, ext::DebugApi},
     alloy_rpc_types::{
         TransactionRequest,
         state::{AccountOverride, StateOverride},
+        trace::geth::{CallConfig, GethDebugTracingCallOptions, GethDebugTracingOptions},
     },
     alloy_sol_types::SolCall,
     alloy_transport::RpcError,
-    anyhow::{Context, Result},
+    anyhow::{Context as AnyhowContext, Result},
     balance_overrides::StateOverriding,
     ethrpc::block_stream::CurrentBlockWatcher,
     model::{
@@ -98,6 +99,10 @@ impl SettlementSimulator {
 
     pub fn vault_relayer_address(&self) -> Address {
         self.0.vault_relayer
+    }
+
+    pub fn tenderly(&self) -> Option<Arc<dyn tenderly::Api>> {
+        self.0.tenderly.clone()
     }
 
     pub fn new_simulation_builder(&self) -> SimulationBuilder {
@@ -212,16 +217,21 @@ impl SimulationBuilder {
         match (protocol.wrappers.is_empty(), protocol.flashloan) {
             (false, Some(_)) => return Err(BuildError::FlashloanWrappersIncompatible),
             (false, None) => {
-                self.wrapper = WrapperConfig::Custom(
-                    protocol
-                        .wrappers
-                        .into_iter()
-                        .map(|w| WrapperCall {
-                            address: w.address,
-                            data: w.data.into(),
-                        })
-                        .collect(),
-                );
+                let mut wrapper_calls = Vec::with_capacity(protocol.wrappers.len());
+                for w in protocol.wrappers {
+                    // TODO: REMOVE THIS HACK!
+                    // Unconditionally add state override for euler compatibility.
+                    // If this state override gets added to calls that don't need it
+                    // it will not interfere with the simulation.
+                    self.account_override_requests
+                        .extend(compute_euler_override(&w));
+
+                    wrapper_calls.push(WrapperCall {
+                        address: w.address,
+                        data: w.data.into(),
+                    });
+                }
+                self.wrapper = WrapperConfig::Custom(wrapper_calls);
             }
             (true, Some(flashloan)) => {
                 self.wrapper = WrapperConfig::Flashloan(vec![FlashloanRequest {
@@ -300,6 +310,125 @@ impl SimulationBuilder {
     }
 }
 
+/// Euler is the only integration for now using wrappers and they have a
+/// chicken and egg problem when quoting. They need a quote to know the
+/// things they have to make the user sign to make the resulting order
+/// work. But for the quote to be accurate we already need to have this
+/// setup done.
+/// To get around this we introduce this temporary hack of
+/// assuming this is an euler wrapper and unconditionally setting up the
+/// requirements using state overrides.
+///
+/// For that we need to write `U256::MAX` to this mapping which lives in
+/// storage slot 24 of contract 0x0C9a3dd6b8F28529d72d7f9cE918D493519EE383:
+/// mapping(bytes19 addressPrefix => mapping(address operator => uint256
+/// operatorBitField)) internal operatorLookup;
+fn compute_euler_override(wrapper: &app_data::WrapperCall) -> Vec<AccountOverrideRequest> {
+    let mut overrides = vec![];
+
+    let ethereum_vault_connector = address!("0x0C9a3dd6b8F28529d72d7f9cE918D493519EE383");
+    let permission_value = B256::from([0xFF_u8; 32]);
+    let slot_24 = B256::with_last_byte(24);
+    let Some(address_prefix) = wrapper.data.get(0..32) else {
+        return overrides;
+    };
+    let address_prefix: [u8; 32] = address_prefix.try_into().unwrap();
+
+    let operator = wrapper.address;
+
+    // Outer slot: keccak256(bytes19_address_prefix ++ slot_24)
+    let outer_slot = {
+        let mut buf = [0u8; 64];
+        // take first 19 populated bytes from the padded address and write
+        // them to the first 19 bytes of the buffer (to "cast" an
+        // `address` to a `bytes19` mapping key).
+        buf[0..19].copy_from_slice(&address_prefix[12..31]);
+        buf[32..64].copy_from_slice(slot_24.as_slice());
+        keccak256(buf)
+    };
+    // Final slot: keccak256(operator ++ outer_slot)
+    let permission_slot = {
+        let mut buf = [0u8; 64];
+        buf[12..32].copy_from_slice(operator.as_slice());
+        buf[32..64].copy_from_slice(outer_slot.as_slice());
+        keccak256(buf)
+    };
+
+    overrides.push(AccountOverrideRequest::Custom {
+        account: ethereum_vault_connector,
+        state: AccountOverride::default().with_state_diff([(permission_slot, permission_value)]),
+    });
+
+    let (domain_separator, type_hash) = match wrapper.address {
+        // open position wrapper
+        x if x == address!("0x59684A689D4a1CAc0f0632F54ec8cDd42612D728") => (
+            b256!("0x0af97cc7912b08e2bc78d17603f600b75eb0759236a4591930fc1e0192c042ff"),
+            b256!("0x37458bde9202dec258a12cf2bc8b4ac302a61cf842bbe3a2bb921d968507d3bf"),
+        ),
+        // close position wrapper
+        x if x == address!("0xa18c87849ef90190117ff1e1e8b4ace6dac7a54b") => (
+            b256!("0xffa38a994108ca56910187ade1b200aca3f27ac295ac150bde63a9b5783af04f"),
+            b256!("0x3cdbf47d3b4f755805c36069980ae18f367b382cf0593fa0378ad50c1c5d1fd8"),
+        ),
+        // collateral swap wrapper
+        x if x == address!("0x175fbd01874e92c9b081f493371fefe009760a42") => (
+            b256!("0xfac3fa57d73575d8f9df481fc13e23240d08bfc183e56bd289a69521402ab2dc"),
+            b256!("0x82f0a6a70fe8cb4c350f918378cd06594e0307d840ad296019fa47d796428016"),
+        ),
+        _ => return Default::default(),
+    };
+
+    let Some(struct_hash_input) = wrapper
+        .data
+        .len()
+        .checked_sub(64)
+        .and_then(|offset| wrapper.data.get(..offset))
+    else {
+        return vec![];
+    };
+
+    let struct_hash = keccak256(
+        type_hash
+            .into_iter()
+            .chain(struct_hash_input.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    let map_key = keccak256(
+        [0x19, 0x01]
+            .into_iter()
+            .chain(domain_separator)
+            .chain(struct_hash)
+            .collect::<Vec<_>>(),
+    );
+
+    // mapping(address => mapping(bytes32 => uint256)) public preApprovedHashes;
+    let first_map_slot = {
+        let mut buf = [0u8; 64];
+        buf[0..32].copy_from_slice(address_prefix.as_slice());
+        // nothing to copy since mapping lives at storage slot 0
+        keccak256(buf)
+    };
+
+    let preapprove_hash_slot = {
+        let mut buf = [0u8; 64];
+        buf[0..32].copy_from_slice(map_key.as_slice());
+        buf[32..64].copy_from_slice(first_map_slot.as_slice());
+        keccak256(buf)
+    };
+
+    // keccak256("PreApprovedHashes.PreApproved")
+    let preapprove_value =
+        b256!("0xfdeb67b02819f1ab9c0e57355ac925e9fe35883f75ef41b364cd780799c5998a");
+
+    overrides.push(AccountOverrideRequest::Custom {
+        account: wrapper.address,
+        state: AccountOverride::default()
+            .with_state_diff([(preapprove_hash_slot, preapprove_value)]),
+    });
+
+    overrides
+}
+
 /// The output of [`SimulationBuilder::build`]: inputs ready to be passed to an
 /// alloy provider for simulation.
 pub struct EthCallInputs {
@@ -309,6 +438,7 @@ pub struct EthCallInputs {
     pub state_overrides: StateOverride,
     pub simulator: SettlementSimulator,
     pub block: u64,
+    pub failed_state_overrides: Vec<AccountOverrideRequest>,
 }
 
 impl EthCallInputs {
@@ -324,15 +454,46 @@ impl EthCallInputs {
 
     /// Runs the generated simulation using an `eth_call` and returns the
     /// response bytes if there are any.
-    pub async fn simulate(self) -> Result<Bytes, RpcError<alloy_transport::TransportErrorKind>> {
+    pub async fn simulate(&self) -> Result<Bytes, RpcError<alloy_transport::TransportErrorKind>> {
         self.simulator
             .0
             .provider
             .clone()
             .call(self.as_transaction_request())
-            .overrides(self.state_overrides)
+            .overrides(self.state_overrides.clone())
             .block(self.block.into())
             .await
+    }
+
+    /// Runs the simulation together with a call tracer. Afterwards the call
+    /// trace gets analyzed to generate a high level report of the simulation
+    /// with information to help the caller understand what went wrong during
+    /// the simulation.
+    pub async fn simulation_report(
+        &self,
+    ) -> Result<report::SimulationReport, RpcError<alloy_transport::TransportErrorKind>> {
+        let trace = self
+            .simulator
+            .0
+            .provider
+            .clone()
+            .debug_trace_call_callframe(
+                self.as_transaction_request(),
+                self.block.into(),
+                GethDebugTracingCallOptions::default()
+                    .with_tracing_options(GethDebugTracingOptions::call_tracer(
+                        CallConfig::default(),
+                    ))
+                    .with_state_overrides(self.state_overrides.clone()),
+            )
+            .await?;
+
+        let context = report::Context {
+            settlement: self.simulator.0.settlement.address(),
+            vault_relayer: &self.simulator.0.vault_relayer,
+            trampoline: &self.simulator.0.hooks_trampoline,
+        };
+        Ok(report::generate_settlement_report(context, trace))
     }
 
     /// Same as [`EthCallInputs::simulate`] but also generates a tenderly
@@ -530,6 +691,13 @@ pub enum AccountOverrideRequest {
     Custom {
         account: Address,
         state: AccountOverride,
+    },
+    /// Sets the given Erc20 token approval.
+    Approval {
+        owner: Address,
+        token: Address,
+        spender: Address,
+        amount: U256,
     },
     /// Pre-signs the given order such that the pre-sign signature check passes.
     PreSignature(OrderUid),

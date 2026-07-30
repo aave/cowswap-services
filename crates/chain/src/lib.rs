@@ -9,8 +9,9 @@ use {
 #[repr(u64)]
 pub enum Chain {
     Mainnet = 1,
+    /// Local anvil fork of mainnet (aave fork). Behaves like mainnet but with a
+    /// distinct chain id so forked deployments don't collide with real mainnet.
     MainnetFork = 123456789,
-    Goerli = 5,
     Gnosis = 100,
     Sepolia = 11155111,
     ArbitrumOne = 42161,
@@ -38,7 +39,6 @@ impl Chain {
         match &self {
             Self::Mainnet => "Ethereum / Mainnet",
             Self::MainnetFork => "Ethereum / Mainnet Fork",
-            Self::Goerli => "Ethereum / Goerli",
             Self::Gnosis => "xDAI",
             Self::Sepolia => "Ethereum / Sepolia",
             Self::ArbitrumOne => "Arbitrum One",
@@ -54,12 +54,32 @@ impl Chain {
         }
     }
 
+    /// Kebab-case slug used in URLs and per-network configs (pool-indexer API
+    /// routes, DB database names, etc). Stable — other services parse it.
+    pub fn as_str(&self) -> &'static str {
+        match &self {
+            Self::Mainnet => "mainnet",
+            Self::MainnetFork => "mainnet-fork",
+            Self::Gnosis => "gnosis",
+            Self::Sepolia => "sepolia",
+            Self::ArbitrumOne => "arbitrum-one",
+            Self::Base => "base",
+            Self::Hardhat => "hardhat",
+            Self::Bnb => "bnb",
+            Self::Avalanche => "avalanche",
+            Self::Optimism => "optimism",
+            Self::Polygon => "polygon",
+            Self::Linea => "linea",
+            Self::Plasma => "plasma",
+            Self::Ink => "ink",
+        }
+    }
+
     /// The default amount in native tokens atoms to use for price estimation
     pub fn default_amount_to_estimate_native_prices_with(&self) -> U256 {
         match &self {
             Self::Mainnet
             | Self::MainnetFork
-            | Self::Goerli
             | Self::Sepolia
             | Self::ArbitrumOne
             | Self::Base
@@ -80,7 +100,6 @@ impl Chain {
         match self {
             Self::Mainnet => Duration::from_millis(12_000),
             Self::MainnetFork => Duration::from_millis(12_000),
-            Self::Goerli => Duration::from_millis(12_000),
             Self::Gnosis => Duration::from_millis(5_000),
             Self::Sepolia => Duration::from_millis(12_000),
             Self::ArbitrumOne => Duration::from_millis(250),
@@ -112,7 +131,6 @@ impl TryFrom<u64> for Chain {
         let network = match value {
             x if x == Self::Mainnet as u64 => Self::Mainnet,
             x if x == Self::MainnetFork as u64 => Self::MainnetFork,
-            x if x == Self::Goerli as u64 => Self::Goerli,
             x if x == Self::Gnosis as u64 => Self::Gnosis,
             x if x == Self::Sepolia as u64 => Self::Sepolia,
             x if x == Self::ArbitrumOne as u64 => Self::ArbitrumOne,
@@ -199,7 +217,6 @@ mod test {
         assert_eq!(Chain::Mainnet.blocks_in(TARGET_AGE).round(), 1800.0);
         assert_eq!(Chain::MainnetFork.blocks_in(TARGET_AGE).round(), 1800.0);
         assert_eq!(Chain::Sepolia.blocks_in(TARGET_AGE).round(), 1800.0);
-        assert_eq!(Chain::Goerli.blocks_in(TARGET_AGE).round(), 1800.0);
         assert_eq!(Chain::Gnosis.blocks_in(TARGET_AGE).round(), 4320.0);
         assert_eq!(Chain::Base.blocks_in(TARGET_AGE).round(), 10800.0);
         assert_eq!(Chain::ArbitrumOne.blocks_in(TARGET_AGE).round(), 86400.0);
@@ -215,10 +232,6 @@ mod test {
         let json_data = "123456789"; // Should deserialize to Network::MainnetFork
         let network: Chain = serde_json::from_str(json_data).unwrap();
         assert_eq!(network, Chain::MainnetFork);
-
-        let json_data = "5"; // Should deserialize to Network::Goerli
-        let network: Chain = serde_json::from_str(json_data).unwrap();
-        assert_eq!(network, Chain::Goerli);
 
         let json_data = "100"; // Should deserialize to Network::Gnosis
         let network: Chain = serde_json::from_str(json_data).unwrap();
@@ -237,13 +250,9 @@ mod test {
         let network: Chain = serde_json::from_str(json_data).unwrap();
         assert_eq!(network, Chain::Mainnet);
 
-        let json_data = "\"123456789\""; // Should parse to u64 123456789 and then to Network::MainnetFork
+        let json_data = "\"123456789\""; // Should parse to u64 and then to Network::MainnetFork
         let network: Chain = serde_json::from_str(json_data).unwrap();
         assert_eq!(network, Chain::MainnetFork);
-
-        let json_data = "\"5\""; // Should parse to u64 5 and then to Network::Goerli
-        let network: Chain = serde_json::from_str(json_data).unwrap();
-        assert_eq!(network, Chain::Goerli);
 
         let json_data = "\"100\""; // Should parse to u64 100 and then to Network::Gnosis
         let network: Chain = serde_json::from_str(json_data).unwrap();

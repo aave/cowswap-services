@@ -31,26 +31,13 @@ pub enum BaselineSource {
 
 pub fn defaults_for_network(chain: &Chain) -> Vec<BaselineSource> {
     match chain {
-        Chain::Mainnet => vec![
+        Chain::Mainnet | Chain::MainnetFork => vec![
             BaselineSource::UniswapV2,
             BaselineSource::SushiSwap,
             BaselineSource::Swapr,
             BaselineSource::BalancerV2,
             BaselineSource::ZeroEx,
             BaselineSource::UniswapV3,
-        ],
-        Chain::MainnetFork => vec![
-            BaselineSource::UniswapV2,
-            BaselineSource::SushiSwap,
-            BaselineSource::Swapr,
-            BaselineSource::BalancerV2,
-            BaselineSource::ZeroEx,
-            BaselineSource::UniswapV3,
-        ],
-        Chain::Goerli => vec![
-            BaselineSource::UniswapV2,
-            BaselineSource::SushiSwap,
-            BaselineSource::BalancerV2,
         ],
         Chain::Gnosis => vec![
             BaselineSource::Honeyswap,

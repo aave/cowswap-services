@@ -17,7 +17,6 @@ use {
     clap::Parser,
     configs::orderbook::Configuration,
     contracts::{
-        BalancerV2Vault,
         ChainalysisOracle,
         FlashLoanRouter,
         GPv2Settlement,
@@ -29,18 +28,20 @@ use {
     http_client::HttpClientFactory,
     model::DomainSeparator,
     num::ToPrimitive,
-    observe::metrics::{DEFAULT_METRICS_PORT, serve_metrics},
+    observe::{
+        config::EventBusConfig,
+        metrics::{DEFAULT_METRICS_PORT, serve_metrics},
+    },
     order_validation,
     price_estimation::{
         PriceEstimating,
         config::price_estimation::BalanceOverridesConfigExt,
         factory::{self, PriceEstimatorFactory},
         native::{FallbackNativePriceEstimator, NativePriceEstimating},
-        trade_verifier::code_fetching::CachedCodeFetcher,
     },
     shared::{
         order_quoting::{self, OrderQuoter},
-        order_validation::{OrderValidPeriodConfiguration, OrderValidator},
+        order_validation::{OrderSimulator, OrderValidPeriodConfiguration, OrderValidator},
     },
     std::{future::Future, net::SocketAddr, sync::Arc, time::Duration},
     token_info::{CachedTokenInfoFetcher, TokenInfoFetcher},
@@ -51,7 +52,9 @@ pub async fn start(args: impl Iterator<Item = String>) {
     let args = Arguments::parse_from(args);
     let config = Configuration::from_path(&args.config)
         .await
-        .expect("failed to load configuration file");
+        .expect("failed to load configuration file")
+        .validate()
+        .expect("failed to validate configuration file");
     let tracing_config = config
         .shared
         .tracing
@@ -75,6 +78,16 @@ pub async fn start(args: impl Iterator<Item = String>) {
     tracing::info!("running order book with validated arguments:\n{}", args);
     observe::panic_hook::install();
     observe::metrics::setup_registry(Some("gp_v2_api".into()), None);
+    if let Some(event_bus) = &config.shared.event_bus {
+        observe::event_bus::init(EventBusConfig {
+            url: event_bus.url.clone(),
+            stream_name: event_bus.channel.clone(),
+            // Presence of `chain-id` alongside `event_bus` is enforced by
+            // `SharedConfig::validate` at startup.
+            chain_id: config.shared.chain_id.unwrap(),
+        })
+        .await;
+    }
     #[cfg(unix)]
     observe::heap_dump_handler::spawn_heap_dump_handler();
     tracing::info!("file configuration:\n{:#?}", config);
@@ -149,20 +162,6 @@ pub async fn run(config: Configuration) {
         balance_overrider.clone(),
     );
 
-    let vault_address = config.shared.contracts.balancer_v2_vault.or_else(|| {
-        let chain_id = chain.id();
-        match BalancerV2Vault::deployment_address(&chain_id) {
-            addr @ Some(_) => addr,
-            addr @ None => {
-                tracing::warn!(
-                    chain_id,
-                    "balancer contracts are not deployed on this network"
-                );
-                addr
-            }
-        }
-    });
-
     let hooks_contract = match config.shared.contracts.hooks {
         Some(address) => HooksTrampoline::Instance::new(address, web3.provider.clone()),
         None => HooksTrampoline::Instance::deployed(&web3.provider)
@@ -208,7 +207,6 @@ pub async fn run(config: Configuration) {
             settlement_contract.clone(),
             balances_contract.clone(),
             vault_relayer,
-            vault_address,
             balance_overrider.clone(),
         ),
     );
@@ -219,16 +217,6 @@ pub async fn run(config: Configuration) {
         .iter()
         .map(shared::arguments::gas_estimator_type_from_config)
         .collect();
-    let gas_price_estimator = Arc::new(InstrumentedGasEstimator::new(
-        gas_price_estimation::create_priority_estimator(
-            http_factory.create(),
-            &web3,
-            &gas_estimators,
-        )
-        .await
-        .expect("failed to create gas price estimator"),
-    ));
-
     let deny_listed_tokens = DenyListedTokens::new(config.unsupported_tokens);
 
     let current_block_args = shared::current_block::Arguments::from(&config.shared.current_block);
@@ -237,11 +225,20 @@ pub async fn run(config: Configuration) {
         .await
         .unwrap();
 
+    let gas_price_estimator = Arc::new(InstrumentedGasEstimator::new(
+        gas_price_estimation::create_priority_estimator(
+            http_factory.create(),
+            &web3.provider,
+            &gas_estimators,
+            &current_block_stream,
+        )
+        .await
+        .expect("failed to create gas price estimator"),
+    ));
+
     let token_info_fetcher = Arc::new(CachedTokenInfoFetcher::new(Arc::new(TokenInfoFetcher {
         web3: web3.clone(),
     })));
-
-    let code_fetcher = Arc::new(CachedCodeFetcher::new(Arc::new(web3.clone())));
 
     let mut price_estimator_factory = PriceEstimatorFactory::new(
         &config.price_estimation,
@@ -267,7 +264,6 @@ pub async fn run(config: Configuration) {
             }),
             deny_listed_tokens: deny_listed_tokens.clone(),
             tokens: token_info_fetcher.clone(),
-            code_fetcher: code_fetcher.clone(),
         },
     )
     .await
@@ -351,7 +347,7 @@ pub async fn run(config: Configuration) {
     };
 
     let create_quoter = |price_estimator: Arc<dyn PriceEstimating>| {
-        Arc::new(OrderQuoter::new(
+        OrderQuoter::new(
             price_estimator,
             native_price_estimator.clone(),
             gas_price_estimator.clone(),
@@ -372,23 +368,47 @@ pub async fn run(config: Configuration) {
             },
             config.price_estimation.quote_timeout,
             config.price_estimation.max_quote_timeout,
-        ))
+        )
     };
-    let optimal_quoter = create_quoter(price_estimator);
+
+    let optimal_quoter = Arc::new(
+        create_quoter(price_estimator.clone()).with_streaming_estimator(price_estimator.clone()),
+    );
+
     // Fast quoting is able to return early and if none of the produced quotes are
     // verifiable we are left with no quote at all. Since fast estimates don't
     // make any promises on correctness we can just skip quote verification for
     // them.
-    let fast_quoter = create_quoter(fast_price_estimator);
+    let fast_quoter = Arc::new(create_quoter(fast_price_estimator));
 
     let app_data_validator = Validator::new(config.app_data_size_limit);
     let chainalysis_oracle = ChainalysisOracle::Instance::deployed(&web3.provider)
         .await
         .ok();
+
+    let order_simulator = price_estimator_factory.settlement_simulator().cloned();
+
+    let validator_simulator = order_simulator.clone().map(|settlement_simulator| {
+        let simulator: Arc<dyn shared::order_creation_simulation::OrderSimulating> = Arc::new(
+            shared::order_creation_simulation::OrderCreationSimulator::new(settlement_simulator),
+        );
+        OrderSimulator {
+            simulator,
+            timeout: config.order_simulation_timeout,
+        }
+    });
+
     let order_validator = Arc::new(OrderValidator::new(
         native_token.clone(),
         Arc::new(order_validation::banned::Users::new(
             chainalysis_oracle,
+            config.banned_users.hermod.clone().map(|hermod| {
+                order_validation::banned::HermodConfig {
+                    url: hermod.url,
+                    hmac_key: hermod.hmac_key,
+                    api_key: hermod.api_key,
+                }
+            }),
             config.banned_users.addresses,
             config.banned_users.max_cache_size.get().to_u64().unwrap(),
         )),
@@ -399,9 +419,9 @@ pub async fn run(config: Configuration) {
         optimal_quoter.clone(),
         balance_fetcher,
         signature_validator,
+        validator_simulator,
         Arc::new(postgres_write.clone()),
         config.order_validation.max_limit_orders_per_user,
-        code_fetcher,
         app_data_validator.clone(),
         config.order_validation.max_gas_per_order,
         config.order_validation.same_tokens_policy,
@@ -420,33 +440,6 @@ pub async fn run(config: Configuration) {
         postgres_write.clone(),
         ipfs,
     ));
-
-    let order_simulator = if let Some(config) = config.order_simulation {
-        let tenderly: Option<Arc<dyn simulator::tenderly::Api>> =
-            config.tenderly.as_ref().map(|tenderly_config| {
-                Arc::new(simulator::tenderly::TenderlyApi::new(
-                    tenderly_config,
-                    &http_factory,
-                    chain.id().to_string(),
-                )) as _
-            });
-        Some(
-            simulator::simulation_builder::SettlementSimulator::new(
-                settlement_contract.clone(),
-                flashloan_router_address,
-                hooks_trampoline_address,
-                *native_token.address(),
-                config.gas_limit.saturating_to(),
-                balance_overrider.clone(),
-                current_block_stream.clone(),
-                tenderly,
-            )
-            .await
-            .expect("failed to initialize SettlementSimulator"),
-        )
-    } else {
-        None
-    };
 
     let orderbook = Arc::new(Orderbook::new(
         domain_separator,
@@ -468,14 +461,16 @@ pub async fn run(config: Configuration) {
         .collect();
     let quotes = QuoteHandler::new(
         order_validator,
-        optimal_quoter,
+        optimal_quoter.clone(),
         app_data.clone(),
         config.volume_fee,
         volume_fee_bucket_overrides,
         config.shared.enable_sell_equals_buy_volume_fee,
+        *native_token.address(),
         token_info_fetcher.clone(),
     )
-    .with_fast_quoter(fast_quoter);
+    .with_fast_quoter(fast_quoter)
+    .with_streaming_quoter(optimal_quoter.clone());
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
     let serve_api = serve_api(

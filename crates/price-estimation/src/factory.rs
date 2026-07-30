@@ -15,7 +15,6 @@ use {
         buffered::{self, BufferedRequest, NativePriceBatchFetching},
         competition::PriceRanking,
         config::{native_price::NativePriceConfig, price_estimation::BalanceOverridesConfigExt},
-        trade_verifier::code_fetching::CachedCodeFetcher,
     },
     alloy::primitives::Address,
     anyhow::{Context as _, Result},
@@ -58,7 +57,6 @@ pub struct Components {
     pub http_factory: HttpClientFactory,
     pub deny_listed_tokens: DenyListedTokens,
     pub tokens: Arc<dyn TokenInfoFetching>,
-    pub code_fetcher: Arc<CachedCodeFetcher>,
 }
 
 /// A factory for initializing shared price estimators.
@@ -67,6 +65,7 @@ pub struct PriceEstimatorFactory<'a> {
     config: &'a NativePriceConfig,
     network: Network,
     components: Components,
+    settlement_simulator: Option<SettlementSimulator>,
     trade_verifier: Option<Arc<dyn TradeVerifying>>,
     estimators: HashMap<String, EstimatorEntry>,
 }
@@ -78,8 +77,14 @@ impl<'a> PriceEstimatorFactory<'a> {
         network: Network,
         components: Components,
     ) -> Result<Self> {
+        let (settlement_simulator, tenderly) =
+            Self::build_simulator(args, &network, &components).await?;
+        let trade_verifier = settlement_simulator
+            .as_ref()
+            .map(|simulator| Self::build_trade_verifier(args, simulator.clone(), tenderly));
         Ok(Self {
-            trade_verifier: Self::trade_verifier(args, &network, &components).await?,
+            settlement_simulator,
+            trade_verifier,
             args,
             config,
             network,
@@ -88,13 +93,17 @@ impl<'a> PriceEstimatorFactory<'a> {
         })
     }
 
-    async fn trade_verifier(
-        args: &'a PriceEstimation,
+    pub fn settlement_simulator(&self) -> Option<&SettlementSimulator> {
+        self.settlement_simulator.as_ref()
+    }
+
+    async fn build_simulator(
+        args: &PriceEstimation,
         network: &Network,
         components: &Components,
-    ) -> Result<Option<Arc<dyn TradeVerifying>>> {
+    ) -> Result<(Option<SettlementSimulator>, Option<Arc<dyn tenderly::Api>>)> {
         let Some(web3) = network.simulation_web3.clone() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let web3 = web3.labeled("simulator");
 
@@ -122,16 +131,22 @@ impl<'a> PriceEstimatorFactory<'a> {
         )
         .await?;
 
-        let verifier = TradeVerifier::new(
+        Ok((Some(simulator), tenderly))
+    }
+
+    fn build_trade_verifier(
+        args: &PriceEstimation,
+        simulator: SettlementSimulator,
+        tenderly: Option<Arc<dyn tenderly::Api>>,
+    ) -> Arc<dyn TradeVerifying> {
+        Arc::new(TradeVerifier::new(
             simulator,
             tenderly,
-            components.code_fetcher.clone(),
             args.quote_inaccuracy_limit.clone(),
             args.tokens_without_verification.iter().cloned().collect(),
             args.min_gas_amount_for_unverified_quotes,
             args.max_gas_amount_for_unverified_quotes,
-        );
-        Ok(Some(Arc::new(verifier)))
+        ))
     }
 
     fn native_token_price_estimation_amount(&self) -> Result<NonZeroU256> {
@@ -336,19 +351,38 @@ impl<'a> PriceEstimatorFactory<'a> {
         )
     }
 
+    /// Builds a [`CompetitionEstimator`] over the given estimators, with each
+    /// one wrapped in its own sanitizer. This per-estimator shape lets the
+    /// single competition serve both the one-shot and streaming quote paths,
+    /// instead of forwarding a stream through one outer sanitizer.
+    fn sanitized_competition(
+        &self,
+        estimators: Vec<(String, Arc<dyn PriceEstimating>)>,
+        ranking: PriceRanking,
+    ) -> CompetitionEstimator<Arc<dyn PriceEstimating>> {
+        let estimators = estimators
+            .into_iter()
+            .map(|(name, estimator)| {
+                (
+                    name,
+                    Arc::new(self.sanitized(estimator)) as Arc<dyn PriceEstimating>,
+                )
+            })
+            .collect();
+        CompetitionEstimator::new(vec![estimators], ranking)
+    }
+
     pub fn price_estimator(
         &mut self,
         solvers: &[ExternalSolver],
         native: Arc<dyn NativePriceEstimating>,
         gas: Arc<dyn GasPriceEstimating>,
-    ) -> Result<Arc<dyn PriceEstimating>> {
+    ) -> Result<Arc<CompetitionEstimator<Arc<dyn PriceEstimating>>>> {
         let estimators = self.get_estimators(solvers, |entry| &entry.optimal)?;
-        let competition_estimator = CompetitionEstimator::new(
-            vec![estimators],
-            PriceRanking::BestBangForBuck { native, gas },
-        )
-        .with_verification(self.args.quote_verification);
-        Ok(Arc::new(self.sanitized(Arc::new(competition_estimator))))
+        Ok(Arc::new(
+            self.sanitized_competition(estimators, PriceRanking::BestBangForBuck { native, gas })
+                .with_verification(self.args.quote_verification),
+        ))
     }
 
     pub fn fast_price_estimator(
@@ -360,13 +394,8 @@ impl<'a> PriceEstimatorFactory<'a> {
     ) -> Result<Arc<dyn PriceEstimating>> {
         let estimators = self.get_estimators(solvers, |entry| &entry.fast)?;
         Ok(Arc::new(
-            self.sanitized(Arc::new(
-                CompetitionEstimator::new(
-                    vec![estimators],
-                    PriceRanking::BestBangForBuck { native, gas },
-                )
+            self.sanitized_competition(estimators, PriceRanking::BestBangForBuck { native, gas })
                 .with_early_return(fast_price_estimation_results_required),
-            )),
         ))
     }
 

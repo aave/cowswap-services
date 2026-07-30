@@ -16,21 +16,17 @@ path = "src/main.rs"
 
 [dependencies]
 account-balances = { workspace = true }
-alloy = { workspace = true, features = [
-  "json-rpc",
-  "provider-anvil-api",
-  "provider-txpool-api",
-  "rand",
-  "rpc-types",
-  "signer-aws",
-  "sol-types"
-] }
+alloy = {
+  workspace = true,
+  features = ["json-rpc", "provider-anvil-api", "provider-txpool-api", "rand", "rpc-types", "signer-aws", "sol-types"]
+}
 app-data = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bad-tokens = { workspace = true }
 balance-overrides = { workspace = true }
 bigdecimal = { workspace = true }
+bytes = { workspace = true }
 bytes-hex = { workspace = true }  # may get marked as unused but it's used with serde
 chain = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }

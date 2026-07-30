@@ -1,4 +1,6 @@
 pub const MAINNET: u64 = 1;
+/// Local anvil fork of mainnet (aave fork). Uses the same deployment addresses
+/// as mainnet since it is a fork of it.
 pub const MAINNET_FORK: u64 = 123456789;
 pub const GNOSIS: u64 = 100;
 pub const SEPOLIA: u64 = 11155111;

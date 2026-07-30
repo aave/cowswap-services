@@ -913,6 +913,54 @@ mod tests {
         TestCase::from_json(case).validate().await;
     }
 
+    /// A solution settling no orders gets a score of 0 which disqualifies it
+    /// from the competition.
+    #[tokio::test]
+    async fn discards_solutions_with_zero_score() {
+        let case = json!({
+            "tokens": [
+                ["Token A", address(0)],
+                ["Token B", address(1)],
+            ],
+            "auction": {
+                "orders": {
+                    "Order 1": {
+                        "side": "sell",
+                        "sell_token": "Token A",
+                        "sell_amount": "32375066190000000000000000",
+                        "buy_token": "Token B",
+                        "buy_amount": "2161512119"
+                    }
+                },
+                "prices": {
+                    "Token A": "32429355240",
+                    "Token B": "480793239987749750742974464"
+                }
+            },
+            "solutions": {
+                "Solution 1": {
+                    "solver": "Solver 1",
+                    "trades": {},
+                },
+                "Solution 2": {
+                    "solver": "Solver 2",
+                    "trades": {
+                        "Order 1": {
+                            "sell_amount": "32375066190000000000000000",
+                            "buy_amount": "2205267875"
+                        }
+                    }
+                }
+            },
+            "expected_fair_solutions": ["Solution 2"],
+            "expected_winners": ["Solution 2"],
+            "expected_reference_scores": {
+                "Solver 2": "0",
+            },
+        });
+        TestCase::from_json(case).validate().await;
+    }
+
     #[serde_as]
     #[derive(Deserialize, Debug)]
     struct TestCase {
@@ -1013,7 +1061,7 @@ mod tests {
                 let solution_uid = hash(solution_id);
                 solution_map.insert(
                     solution_id,
-                    create_bid(solution_uid, solver_address, trades, None).await,
+                    create_bid(solution_uid, solver_address, trades).await,
                 );
             }
 
@@ -1195,22 +1243,10 @@ mod tests {
         solution_id: u64,
         solver_address: Address,
         trades: Vec<(OrderUid, TradedOrder)>,
-        prices: Option<HashMap<TokenAddress, Price>>,
     ) -> Bid<Unscored> {
-        // The prices of the tokens do not affect the result but they keys must exist
-        // for every token of every trade
-        let prices = prices.unwrap_or({
-            let mut res = HashMap::new();
-            for (_, trade) in &trades {
-                res.insert(trade.buy.token, create_price(eth::U256::ONE));
-                res.insert(trade.sell.token, create_price(eth::U256::ONE));
-            }
-            res
-        });
-
         let trade_order_map: HashMap<OrderUid, TradedOrder> = trades.into_iter().collect();
 
-        let solution = Solution::new(solution_id, solver_address, trade_order_map, prices);
+        let solution = Solution::new(solution_id, solver_address, trade_order_map);
 
         let driver = Driver::try_new(
             url::Url::parse("http://localhost").unwrap(),
