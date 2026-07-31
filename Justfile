@@ -61,11 +61,6 @@ fmt-toml *extra:
     tombi format {{extra}}
 
 
-# Format .toml files in the repository
-fmt-toml *extra:
-    tombi format {{extra}}
-
-
 # Start database for E2E tests
 start-db:
     docker compose up -d

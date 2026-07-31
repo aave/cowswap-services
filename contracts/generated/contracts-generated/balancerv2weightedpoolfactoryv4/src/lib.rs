@@ -1481,6 +1481,10 @@ pub const fn deployment_info(chain_id: u64) -> Option<(Address, Option<u64>)> {
             ::alloy_primitives::address!("0x7920BFa1b2041911b354747CA7A6cDD2dfC50Cfd"),
             Some(3424893u64),
         )),
+        123456789u64 => Some((
+            ::alloy_primitives::address!("0x897888115Ada5773E02aA29F775430BFB5F34c51"),
+            Some(16878323u64),
+        )),
         _ => None,
     }
 }
