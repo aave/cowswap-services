@@ -5,6 +5,7 @@ use {
     },
     configs::{
         autopilot::{Configuration, native_price::NativePriceConfig},
+        native_price::Eip4626Config,
         native_price_estimators::{NativePriceEstimator, NativePriceEstimators},
         test_util::TestDefault,
     },
@@ -45,6 +46,10 @@ const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 /// DAI on mainnet — 18-decimal counterpart to USDC for testing the
 /// `6-decimal vault wrapping 18-decimal asset` direction.
 const DAI: Address = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
+
+/// wmtUSDC on mainnet — a partial EIP-4626 implementation that exposes
+/// `asset()` but reverts on `convertToAssets()`. Must classify as non-vault.
+const WMT_USDC: Address = address!("C9499006a149C553d18171747ED19Aa7C6Dd19E2");
 
 #[tokio::test]
 #[ignore]
@@ -93,7 +98,10 @@ async fn eip4626_native_price_test(web3: Web3) {
     let driver_url: url::Url = "http://localhost:11088/test_solver".parse().unwrap();
     let autopilot_config = Configuration {
         native_price_estimation: NativePriceConfig {
-            eip4626: true,
+            eip4626: Eip4626Config {
+                enabled: true,
+                ..Default::default()
+            },
             estimators: NativePriceEstimators::new(vec![vec![NativePriceEstimator::driver(
                 "test_quoter".to_string(),
                 driver_url,
@@ -183,7 +191,10 @@ async fn eip4626_recursive_native_price_test(web3: Web3) {
     let driver_url: url::Url = "http://localhost:11088/test_solver".parse().unwrap();
     let autopilot_config = Configuration {
         native_price_estimation: NativePriceConfig {
-            eip4626: true,
+            eip4626: Eip4626Config {
+                enabled: true,
+                ..Default::default()
+            },
             estimators: NativePriceEstimators::new(vec![vec![NativePriceEstimator::driver(
                 "test_quoter".to_string(),
                 driver_url,
@@ -317,7 +328,10 @@ async fn eip4626_decimal_mismatch_native_price_test(web3: Web3) {
     let driver_url: url::Url = "http://localhost:11088/test_solver".parse().unwrap();
     let autopilot_config = Configuration {
         native_price_estimation: NativePriceConfig {
-            eip4626: true,
+            eip4626: Eip4626Config {
+                enabled: true,
+                ..Default::default()
+            },
             estimators: NativePriceEstimators::new(vec![vec![NativePriceEstimator::driver(
                 "test_quoter".to_string(),
                 driver_url,
@@ -392,7 +406,7 @@ async fn eip4626_empty_revert_terminal_token_test(web3: Web3) {
     // unchanged — any fixed value works.
     let expected_price = 0.0001;
     let inner = FixedPrice(expected_price);
-    let estimator = Eip4626::new(Box::new(inner), web3.provider);
+    let estimator = Eip4626::new(Box::new(inner), web3.provider, std::iter::empty());
 
     for token in [BUY_ETH_ADDRESS, USDC, GNO] {
         let price = estimator
@@ -401,6 +415,29 @@ async fn eip4626_empty_revert_terminal_token_test(web3: Web3) {
             .expect("empty-revert on terminal token must not abort the unwrap");
         assert_eq!(price, expected_price);
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn forked_node_mainnet_eip4626_partial_vault_terminal_token() {
+    run_forked_test(
+        eip4626_partial_vault_terminal_token_test,
+        std::env::var("FORK_URL_MAINNET")
+            .expect("FORK_URL_MAINNET must be set to run forked tests"),
+    )
+    .await;
+}
+
+async fn eip4626_partial_vault_terminal_token_test(web3: Web3) {
+    let expected_price = 0.0001;
+    let inner = FixedPrice(expected_price);
+    let estimator = Eip4626::new(Box::new(inner), web3.provider, std::iter::empty());
+
+    let price = estimator
+        .estimate_native_price(WMT_USDC, HEALTHY_PRICE_ESTIMATION_TIME)
+        .await
+        .expect("token missing convertToAssets() must classify as non-vault, not abort");
+    assert_eq!(price, expected_price);
 }
 
 struct FixedPrice(f64);

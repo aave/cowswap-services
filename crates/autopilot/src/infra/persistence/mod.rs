@@ -6,13 +6,13 @@ use {
             self,
             settlement::{SettlementEvent, TradeEvent, transaction::EncodedTrade},
         },
-        infra::persistence::dto::{AuctionId, RawAuctionData},
     },
     ::winner_selection::state::RankedItem,
     alloy::primitives::B256,
     anyhow::Context,
     bigdecimal::{BigDecimal, ToPrimitive},
     boundary::database::byte_array::ByteArray,
+    bytes::Bytes,
     chrono::{DateTime, Utc},
     database::{
         events::EventIndex,
@@ -58,8 +58,8 @@ pub struct Persistence {
 
 struct AuctionUpload {
     auction_id: domain::auction::Id,
-    /// Contains everything buy the auction_id.
-    auction_data: RawAuctionData,
+    /// The serialized auction, containing everything but the auction_id.
+    json: Bytes,
 }
 
 impl Persistence {
@@ -84,7 +84,7 @@ impl Persistence {
         tokio::task::spawn(async move {
             while let Some(upload) = receiver.recv().await {
                 if let Err(err) = db
-                    .replace_current_auction(upload.auction_id, upload.auction_data)
+                    .replace_current_auction(upload.auction_id, upload.json)
                     .await
                 {
                     tracing::error!(?err, "failed to replace auction in DB");
@@ -151,33 +151,55 @@ impl Persistence {
             .map_err(DatabaseError)
     }
 
-    /// Spawns a background task that replaces the current auction in the DB
-    /// with the new one.
-    pub fn replace_current_auction_in_db(
-        &self,
-        new_auction_id: domain::auction::Id,
-        new_auction_data: &domain::RawAuctionData,
-    ) {
-        self.upload_queue
-            .send(AuctionUpload {
-                auction_id: new_auction_id,
-                auction_data: dto::auction::from_domain(new_auction_data.clone()),
+    /// Archives the auction to the DB and, if configured, to S3.
+    ///
+    /// Only the conversion into the archival shape is on the run loop's
+    /// critical path; the serialization and both sinks happen in background
+    /// tasks. The auction is taken by reference so the conversion doesn't
+    /// need a deep clone.
+    #[instrument(skip_all)]
+    pub fn archive_auction(&self, id: domain::auction::Id, auction: &domain::RawAuctionData) {
+        let auction_data = {
+            let _timer = observe::metrics::metrics()
+                .on_auction_overhead_start("autopilot", "convert_auction");
+            dto::auction::from_domain(auction)
+        };
+
+        let upload_to_s3 = !auction.orders.is_empty();
+        let this = self.clone();
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                let json = match serde_json::to_vec(&auction_data).map(Bytes::from) {
+                    Ok(json) => json,
+                    Err(err) => {
+                        tracing::error!(?err, ?id, "failed to serialize auction");
+                        return;
+                    }
+                };
+
+                this.upload_queue
+                    .send(AuctionUpload {
+                        auction_id: id,
+                        json: json.clone(),
+                    })
+                    .expect("upload queue should be alive at all times");
+
+                if upload_to_s3 {
+                    this.upload_auction_to_s3(id, json);
+                }
             })
-            .expect("upload queue should be alive at all times");
+        });
     }
 
-    /// Spawns a background task that uploads the auction to S3.
-    pub fn upload_auction_to_s3(&self, id: domain::auction::Id, auction: &domain::RawAuctionData) {
-        if auction.orders.is_empty() {
-            return;
-        }
+    /// Spawns a background task that uploads the already serialized auction to
+    /// S3.
+    fn upload_auction_to_s3(&self, id: domain::auction::Id, json: Bytes) {
         let Some(s3) = self.s3.clone() else {
             return;
         };
-        let auction = auction.clone();
         tokio::task::spawn(async move {
-            let auction_dto = dto::auction::from_domain(auction);
-            match s3.upload(id.to_string(), auction_dto).await {
+            match s3.upload_json_bytes(id.to_string(), json).await {
                 Ok(key) => tracing::info!(?key, "uploaded auction to s3"),
                 Err(err) => tracing::warn!(?err, "failed to upload auction to s3"),
             }
@@ -260,24 +282,6 @@ impl Persistence {
         Ok(ex.commit().await?)
     }
 
-    /// Saves the surplus capturing jit order owners to the DB
-    pub async fn save_surplus_capturing_jit_order_owners(
-        &self,
-        auction_id: AuctionId,
-        surplus_capturing_jit_order_owners: &[eth::Address],
-    ) -> Result<(), DatabaseError> {
-        self.postgres
-            .save_surplus_capturing_jit_order_owners(
-                auction_id,
-                &surplus_capturing_jit_order_owners
-                    .iter()
-                    .map(|address| ByteArray(address.0.into()))
-                    .collect::<Vec<_>>(),
-            )
-            .await
-            .map_err(DatabaseError)
-    }
-
     /// Inserts an order event for each order uid in the given set.
     /// Unique order uids are required to avoid inserting events with the same
     /// label within the same order_uid. If this function encounters an error it
@@ -304,13 +308,14 @@ impl Persistence {
         reason: Option<OrderFilterReason>,
     ) where
         I: IntoIterator + Send + 'static,
+        I::IntoIter: Send,
         I::Item: Send,
         F: (Fn(I::Item) -> domain::OrderUid) + Send + 'static,
     {
         let db = self.postgres.clone();
         tokio::spawn(
             async move {
-                let order_uids = items.into_iter().map(convert).collect();
+                let order_uids = items.into_iter().map(convert);
                 match db.pool.acquire().await {
                     Ok(mut tx) => {
                         store_order_events(&mut tx, order_uids, label, reason, Utc::now()).await;
@@ -387,19 +392,17 @@ impl Persistence {
 
         let mut ex = self.postgres.pool.acquire().await?;
 
-        let order_uids: Vec<_> = auction
-            .orders
-            .iter()
-            .map(|order| ByteArray(order.uid.0))
-            .collect();
-
         database::auction::save(
             &mut ex,
             database::auction::Auction {
                 id: auction.id,
                 block: i64::try_from(auction.block).context("block overflow")?,
                 deadline: i64::try_from(deadline).context("deadline overflow")?,
-                order_uids: order_uids.clone(),
+                order_uids: auction
+                    .orders
+                    .iter()
+                    .map(|order| ByteArray(order.uid.0))
+                    .collect(),
                 price_tokens: auction
                     .prices
                     .keys()
@@ -419,7 +422,15 @@ impl Persistence {
         )
         .await?;
 
-        database::auction::save_auction_orders(&mut ex, auction.id, &order_uids).await?;
+        // Inserting into `competition_auctions` grows the pending list of its GIN
+        // index, which periodically causes DB latency spikes. Clean it right
+        // where the need originates, without blocking auction post-processing.
+        let postgres = self.postgres.clone();
+        tokio::spawn(async move {
+            if let Err(err) = postgres.gin_clean_pending_list().await {
+                tracing::warn!(?err, "failed to clean gin pending list");
+            }
+        });
 
         Ok(())
     }
@@ -442,22 +453,24 @@ impl Persistence {
             .await
             .map_err(error::Auction::DatabaseError)?;
 
-        let surplus_capturing_jit_order_owners =
-            database::surplus_capturing_jit_order_owners::fetch(&mut ex, auction_id)
-                .await
-                .map_err(error::Auction::DatabaseError)?
-                .ok_or(error::Auction::NotFound)?
-                .into_iter()
-                .map(|owner| eth::Address::new(owner.0))
-                .collect();
-
-        let prices = database::auction_prices::fetch(&mut ex, auction_id)
+        let auction_row = database::auction::fetch(&mut ex, auction_id)
             .await
             .map_err(error::Auction::DatabaseError)?
+            .ok_or(error::Auction::NotFound)?;
+
+        let surplus_capturing_jit_order_owners = auction_row
+            .surplus_capturing_jit_order_owners
             .into_iter()
-            .map(|price| {
-                let token = eth::Address::new(price.token.0).into();
-                let price = big_decimal_to_u256(&price.price)
+            .map(|owner| eth::Address::new(owner.0))
+            .collect();
+
+        let prices = auction_row
+            .price_tokens
+            .into_iter()
+            .zip(auction_row.price_values)
+            .map(|(token, price)| {
+                let token = eth::Address::new(token.0).into();
+                let price = big_decimal_to_u256(&price)
                     .ok_or(domain::auction::InvalidPrice)
                     .and_then(|p| domain::auction::Price::try_new(p.into()))
                     .map_err(|_err| error::Auction::InvalidPrice(token));
@@ -465,19 +478,21 @@ impl Persistence {
             })
             .collect::<Result<_, _>>()?;
 
+        let block = u64::try_from(auction_row.block)
+            .map_err(|_| error::Auction::NotFound)?
+            .into();
+
         let orders = {
-            let auction_orders = database::auction::get_order_uids(&mut ex, auction_id)
-                .await
-                .map_err(error::Auction::DatabaseError)?
-                .ok_or(error::Auction::NotFound)?
-                .into_iter()
-                .map(|order| domain::OrderUid(order.0))
-                .collect::<HashSet<_>>();
             // Code that uses the data assembled by this function determines JIT orders
             // by their presence in the `orders => fee_policies` mapping. If an order has
             // a mapping it is assumed that this was a regular order and not a JIT order.
             // So in order to not misclassify JIT orders as regular orders we only fetch
             // fee policies for orders that were part of the original auction.
+            let auction_orders: HashSet<domain::OrderUid> = auction_row
+                .order_uids
+                .into_iter()
+                .map(|order| domain::OrderUid(order.0))
+                .collect();
             let relevant_orders: HashSet<_> = trades
                 .iter()
                 .filter(|t| auction_orders.contains(&t.uid))
@@ -535,16 +550,6 @@ impl Persistence {
             orders
         };
 
-        let block = {
-            let block = database::solver_competition::auction_start_block(&mut ex, auction_id)
-                .await?
-                .ok_or(error::Auction::NotFound)?;
-            block
-                .parse::<u64>()
-                .map_err(|_| error::Auction::NotFound)?
-                .into()
-        };
-
         Ok(domain::settlement::Auction {
             id: auction_id,
             block,
@@ -597,6 +602,7 @@ impl Persistence {
                 &mut tx,
                 &updated_order_uids,
                 after_timestamp,
+                started_at.timestamp(),
             )
             .map(|result| match result {
                 Ok(order) => full_order_into_model_order(order)
@@ -808,18 +814,22 @@ impl Persistence {
                 "settlement update",
             );
 
-            database::settlements::update_settlement_solver(
+            database::settlements::update_settlement_solver_and_gas(
                 &mut ex,
                 block_number,
                 log_index,
                 solver,
                 settlement.solution_uid(),
+                // We're not expecting this to actually happen, BUT, since this is the cost of a
+                // transaction we'll double count this value if 1 transaction has 2 settlements
+                u256_to_big_decimal(&gas.0),
+                u256_to_big_decimal(&gas_price.0.0),
             )
             .await?;
 
             store_order_events(
                 &mut ex,
-                fee_breakdown.keys().cloned().collect(),
+                fee_breakdown.keys().cloned(),
                 OrderEventLabel::Traded,
                 None,
                 Utc::now(),

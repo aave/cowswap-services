@@ -100,7 +100,7 @@ async fn summarize_request(req: Request<axum::body::Body>, next: Next) -> Respon
     let response = next.run(req).await;
     let status = response.status().as_u16();
 
-    tracing::info!(
+    tracing::trace!(
         method,
         uri,
         user_agent,
@@ -123,6 +123,11 @@ async fn with_matched_path_metric(req: Request<axum::body::Body>, next: Next) ->
         .map(|path| path.as_str())
         .unwrap_or("unknown");
     let method_with_path = format!("{http_method} {matched_path}");
+
+    metrics
+        .requests_started
+        .with_label_values(&[method_with_path.as_str()])
+        .inc();
 
     let response = {
         let _timer = metrics
@@ -356,6 +361,10 @@ pub fn handle_all_routes(
 #[derive(prometheus_metric_storage::MetricStorage, Clone, Debug)]
 #[metric(subsystem = "api")]
 struct ApiMetrics {
+    /// Number of started API requests.
+    #[metric(labels("method"))]
+    requests_started: prometheus::IntCounterVec,
+
     /// Number of completed API requests.
     #[metric(labels("method", "status_code"))]
     requests_complete: prometheus::IntCounterVec,

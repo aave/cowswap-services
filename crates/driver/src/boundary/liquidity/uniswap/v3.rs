@@ -5,7 +5,7 @@ use {
             self,
             liquidity::{
                 self,
-                uniswap::v3::{Fee, Liquidity, LiquidityNet, Pool, SqrtPrice, Tick},
+                uniswap::v3::{Fee, Liquidity, Pool, SqrtPrice, Tick},
             },
         },
         infra::{self, blockchain::Ethereum, liquidity::config::UniswapV3PoolSource},
@@ -58,13 +58,7 @@ pub fn to_domain(id: liquidity::Id, pool: ConcentratedLiquidity) -> Result<liqui
             sqrt_price: SqrtPrice(pool.pool.state.sqrt_price),
             liquidity: Liquidity(u128::try_from(pool.pool.state.liquidity)?),
             tick: Tick(pool.pool.state.tick),
-            liquidity_net: pool
-                .pool
-                .state
-                .liquidity_net
-                .iter()
-                .map(|(key, value)| (Tick(*key), LiquidityNet(*value)))
-                .collect(),
+            liquidity_net: pool.pool.state.liquidity_net.clone(),
             fee: Fee(pool.pool.state.fee),
         }),
     })
@@ -120,11 +114,32 @@ async fn init_liquidity(
     config: &infra::liquidity::config::UniswapV3,
 ) -> anyhow::Result<impl LiquidityCollecting + use<>> {
     let web3 = eth.web3().clone();
-    let source = build_pool_data_source(eth, config).await?;
+    let http = boundary::liquidity::http_client();
+    let mut fetch_on_demand = false;
+    let source: Arc<dyn V3PoolDataSource> = match &config.pool_source {
+        UniswapV3PoolSource::PoolIndexer(indexer) => {
+            tracing::info!(url = %indexer.url, "uniswap v3: using pool-indexer as data source");
+            let client = PoolIndexerClient::new(indexer.url.clone(), eth.chain(), http);
+            fetch_on_demand = client.fetch_on_demand();
+            Arc::new(client)
+        }
+        UniswapV3PoolSource::Subgraph(subgraph) => {
+            tracing::info!(url = %subgraph.url, "uniswap v3: using subgraph as data source");
+            let client = UniV3SubgraphClient::from_subgraph_url(
+                &subgraph.url,
+                http,
+                subgraph.max_pools_per_tick_query,
+            )
+            .await
+            .context("failed to construct UniV3 subgraph client")?;
+            Arc::new(client)
+        }
+    };
 
     let pool_fetcher = Arc::new(
         UniswapV3PoolFetcher::new(
             source,
+            fetch_on_demand,
             web3.clone(),
             block_retriever,
             config.max_pools_to_initialize,
@@ -144,40 +159,4 @@ async fn init_liquidity(
         *eth.contracts().settlement().address(),
         pool_fetcher,
     ))
-}
-
-/// Picks the V3 pool data source based on the configured pool source variant.
-async fn build_pool_data_source(
-    eth: &Ethereum,
-    config: &infra::liquidity::config::UniswapV3,
-) -> anyhow::Result<Arc<dyn V3PoolDataSource>> {
-    let http = boundary::liquidity::http_client();
-
-    match &config.pool_source {
-        UniswapV3PoolSource::PoolIndexer(indexer) => {
-            tracing::info!(
-                url = %indexer.url,
-                wait_until_timeout = ?indexer.wait_until_timeout,
-                "uniswap v3: using pool-indexer as data source",
-            );
-            Ok(Arc::new(PoolIndexerClient::new(
-                indexer.url.clone(),
-                eth.chain(),
-                http,
-                indexer.wait_until_timeout,
-            )))
-        }
-        UniswapV3PoolSource::Subgraph(subgraph) => {
-            tracing::info!(url = %subgraph.url, "uniswap v3: using subgraph as data source");
-            Ok(Arc::new(
-                UniV3SubgraphClient::from_subgraph_url(
-                    &subgraph.url,
-                    http,
-                    subgraph.max_pools_per_tick_query,
-                )
-                .await
-                .context("failed to construct UniV3 subgraph client")?,
-            ))
-        }
-    }
 }

@@ -66,6 +66,7 @@ Contains all auctions for which a valid solver competition exists.
 Indexes:
 - PRIMARY KEY: btree(`id`)
 - competition_auction_deadline: btree(`deadline`)
+- competition_auctions_order_uids_gin: gin(`order_uids`)
 
 ### ethflow\_orders
 
@@ -266,7 +267,8 @@ Column                    | Type                         | Nullable | Details
  sell\_token\_balance     | [enum](#selltokensource)     | not null | defines how sell\_tokens need to be transferred into the settlement contract
  buy\_token\_balance      | [enum](#buytokendestination) | not null | defined how buy\_tokens need to be transferred back to the user
  class                    | [enum](#orderclass)          | not null | determines which special trade semantics will apply to the execution of this order
- true_valid_to | timestamptz                  | not null | timestamp at which order is no longer executable. For regular orders it is the same value as valid_to. Some orders may have multiple valid_to values, such as ethflow: which is initially signed with u32::MAX. Their true validity comes from the Settlement contract's events which is used for liveness checks.
+ true_valid_to | bigint                       | not null | UNIX timestamp at which order is no longer executable. For regular orders it is the same value as valid_to. Some orders may have multiple valid_to values, such as ethflow: which is initially signed with u32::MAX. Their true validity comes from the Settlement contract's events which is used for liveness checks.
+ valid\_from               | bigint                       | nullable | earliest UNIX timestamp (in seconds) at which the order may enter a batch auction. Taken from the order's app-data (`validFrom`). NULL means no lower bound, i.e. the order is eligible immediately (the default for all existing orders).
 
 Indexes:
 - PRIMARY KEY: btree(`uid`)
@@ -278,6 +280,7 @@ Indexes:
 - user_order_creation_timestamp: btree(`owner`, `creation_timestamp` DESC)
 - version_idx: btree(`settlement_contract`)
 - orders\_true\_valid\_to: btree(`true_valid_to`)
+- orders\_valid\_from: btree(`valid_from`) WHERE valid_from IS NOT NULL
 - orders_owner_covering: btree(`owner`) INCLUDE (`uid`, `kind`, `buy_amount`, `sell_amount`, `fee_amount`, `buy_token`, `sell_token`)
 - orders_owner_class_valid_composite: btree(`owner`, `class`, `true_valid_to` DESC) WHERE cancellation_timestamp IS NULL
 
@@ -422,14 +425,18 @@ Indexes:
 
 Stores data and metadata of [`Settlement`](https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L67-L68) events emitted from the settlement contract.
 
- Column        | Type   | Nullable | Details
----------------|--------|----------|--------
- block\_number | bigint | not null | block in which the settlement happened
- log\_index    | bigint | not null | index in which the event was emitted
- solver        | bytea  | not null | public address of the executing solver
- tx\_hash      | bytea  | not null | transaction hash in which the settlement got executed
- auction\_id    | bigint | nullable | corresponding auction ID that initiated the settlement
- solution\_uid  | bigint | nullable | corresponding winning solver's solution UID, which is also used to identify settlements from the current environment
+ Column                | Type           | Nullable | Details
+-----------------------|----------------|----------|--------
+block\_number          | bigint         | not null | block in which the settlement happened
+log\_index             | bigint         | not null | index in which the event was emitted
+solver                 | bytea          | not null | public address of the executing solver
+tx\_hash               | bytea          | not null | transaction hash in which the settlement got executed
+auction\_id            | bigint         | nullable | corresponding auction ID that initiated the settlement
+solution\_uid          | bigint         | nullable | corresponding winning solver's solution UID, which is also used to identify settlements from the current environment
+gas\_used              | numeric(78, 0) | nullable | gas consumed by the settlement transaction, read from the transaction receipt
+ effective\_gas\_price | numeric(78, 0) | nullable | gas price actually paid per unit of gas (in wei), read from the transaction receipt
+
+The total on-chain cost of a settlement is `gas_used * effective_gas_price`. Both columns are populated by the `autopilot`'s settlement observer and are only set for settlements observed after the migration that added them; historical rows were not backfilled, so consumers (e.g. the `orderbook` attributing gas cost to individual trades and orders) must handle `NULL`.
 
 Indexes:
 - PRIMARY KEY: btree(`block_number`,`log_index`)
@@ -456,18 +463,6 @@ Indexes:
 - PRIMARY KEY: btree(`auction_id`, `solver`, `solution_uid`)
 - settlement\_executions\_time\_range\_index: btree(`start_timestamp`, `end_timestamp`)
 
-### solver\_competitions
-
-Stores an overview of the solver competition. It contains orders in the auction along with prices for every relevant token as well as all valid solutions submitted by solvers together with their quality.
-
- Column | Type   | Nullable | Details
---------|--------|----------|--------
- id     | bigint | not null | id of the auction that the solver competition belongs to
- json   | jsonb  | nullable | overview of the solver competition with unspecified format
-
-Indexes:
-- PRIMARY KEY: btree(`id`)
-
 ### trades
 
 This table contains data of [`Trade`](https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol#L49-L58) events issued by the settlement contract after a successful settlement.
@@ -485,18 +480,6 @@ Indexes:
 - PRIMARY KEY: btree(`block_number`, `log_index`)
 - trade\_order\_uid: btree (`order_uid`, `block_number`, `log_index`)
 - trades_covering: btree(`order_uid`) INCLUDE (`buy_amount`, `sell_amount`, `fee_amount`)
-
-### surplus\_capturing\_jit\_order\_owners
-
-Stores all surplus capturing jit order owners that are part of an auction. JIT orders settled for addresses which were not part of a given auction will not count towards surplus.
-
- Column     | Type    | Nullable | Details
-------------|---------|----------|--------
-auction\_id | bigint  | not null | which auction this order was part of
-owners      | bytea[] | not null | surplus capturing jit order owner included in the auction
-
-Indexes:
-- PRIMARY KEY: btree(`auction_id`)
 
 ### jit\_orders
 
@@ -532,99 +515,7 @@ Indexes:
 - jit\_user\_order\_creation\_timestamp: btree(`owner`, `creation_timestamp` DESC)
 - jit\_event\_id: btree(`block_number`, `log_index`)
 
-### pool\_indexer\_checkpoints
-
-Highest finalized block processed per `contract_address` by `pool-indexer`. `contract_address` is the factory address. The indexer runs one process per network against its own DB, so there's no `chain_id` column.
-
- Column             | Type   | Nullable | Details
---------------------|--------|----------|--------
- contract\_address  | bytea  | not null | Factory address (20 bytes)
- block\_number      | bigint | not null |
-
-Indexes:
-- PRIMARY KEY: btree (`contract_address`)
-
-### uniswap\_v3\_pools
-
-One row per pool discovered from a `PoolCreated` event. `token{0,1}_{decimals,symbol}` are nullable and filled in by the backfill task. `factory` partitions the table when multiple V3-compatible factories run on the same network so each indexer touches only its own rows.
-
- Column            | Type     | Nullable | Details
--------------------|----------|----------|--------
- address           | bytea    | not null | Pool address (20 bytes)
- factory           | bytea    | not null | Address of the V3 factory that emitted `PoolCreated`
- token0            | bytea    | not null |
- token1            | bytea    | not null |
- fee               | int      | not null | Hundredths of a basis point (500 = 0.05%, 3000 = 0.3%, 10000 = 1%). `CHECK (fee > 0)`.
- token0\_decimals  | smallint | nullable | `NULL` = not yet fetched. `-1` = sentinel for "fetched but call failed"
- token1\_decimals  | smallint | nullable |
- token0\_symbol    | text     | nullable | `NULL` = not yet fetched. `""` = sentinel for "fetched but call failed"
- token1\_symbol    | text     | nullable |
- created\_block    | bigint   | not null | Block in which the pool was created on-chain
-
-Indexes:
-- PRIMARY KEY: btree (`address`)
-- Four partial indexes on `(token{0,1})` with predicate `token{0,1}_{symbol,decimals} IS NULL` to power the backfill scan.
-
-### uniswap\_v3\_pool\_states
-
-Current state per pool: `sqrt_price_x96` and `tick` come from the latest `Swap`/`Initialize`; `liquidity` and `block_number` also update on in-range `Mint`/`Burn`. FK → `uniswap_v3_pools`.
-
-**Uniswap V3 pool-state primer.** Three values capture a pool's instantaneous state:
-
-- `sqrt_price_x96` — `sqrt(price) * 2^96` where `price = token1/token0`, stored in Q64.96 fixed-point. The square-root form keeps swap math additive and bounds precision loss over the uint160 range. Mirrors on-chain `slot0.sqrtPriceX96`.
-- `tick` — `floor(log_{1.0001}(price))`. Each tick is a ~0.01% price step; the current tick is the bucket the live price falls into. Routers use it to decide which positions are in-range.
-- `liquidity` — sum of every position's liquidity whose `tickLower <= current_tick < tickUpper`. This is the `L` in V3's invariant `Δsqrt_price = Δamount / L`. Updates on `Swap` (the event carries the new value) and on `Mint`/`Burn` whose range spans the current tick.
-
-The per-tick deltas that move `liquidity` when the price crosses a tick boundary live in [`uniswap_v3_ticks`](#uniswap_v3_ticks).
-
- Column            | Type    | Nullable | Details
--------------------|---------|----------|--------
- pool\_address     | bytea   | not null | FK → `uniswap_v3_pools(address)`
- block\_number     | bigint  | not null | Block of the most recent state-changing event (`Swap`, `Initialize`, or in-range `Mint`/`Burn`).
- sqrt\_price\_x96  | numeric | not null | uint160 — see primer above
- liquidity         | numeric | not null | uint128 — see primer above
- tick              | int     | not null | signed int24 — see primer above
-
-Indexes:
-- PRIMARY KEY: btree (`pool_address`)
-
-### uniswap\_v3\_ticks
-
-Per-tick liquidity deltas. Rows with `liquidity_net = 0` are pruned. FK → `uniswap_v3_pools`.
-
-**Why deltas instead of per-tick totals.** A V3 position covers `[tickLower, tickUpper)` and contributes to pool liquidity only when the current tick is in that range. We store the entering / exiting deltas at the bounds:
-
-- At `tickLower`: `liquidity_net += position.liquidity` (entering)
-- At `tickUpper`: `liquidity_net -= position.liquidity` (exiting)
-
-When a swap crosses a tick boundary, the pool's `liquidity` shifts by `± tick.liquidity_net`. This encoding makes the per-tick aggregate O(1) at swap time — no per-position iteration.
-
-Quoters consult these to predict liquidity changes at tick crossings during swap simulation. Without them, large swaps would be priced as if the liquidity stayed flat, producing wildy wrong quotes
-
- Column         | Type    | Nullable | Details
-----------------|---------|----------|--------
- pool\_address  | bytea   | not null | FK → `uniswap_v3_pools(address)`
- tick\_idx      | int     | not null | Tick coordinate (signed int24); same domain as [`uniswap_v3_pool_states.tick`](#uniswap_v3_pool_states)
- liquidity\_net | numeric | not null | int128, signed — net liquidity entering (+) / exiting (-) at this tick
-
-Indexes:
-- PRIMARY KEY: btree (`pool_address`, `tick_idx`)
-
-### cow\_amms
-
-Stores information about indexed CoW AMMs that have been discovered through blockchain events. Each row represents a CoW AMM pool with its associated factory contract and tradeable tokens.
-
- Column             | Type     | Nullable | Details
---------------------|----------|----------|--------
- address            | bytea    | not null | Address of the CoW AMM pool contract
- factory\_address   | bytea    | not null | Address of the factory contract associated with this AMM
- tradeable\_tokens  | bytea[]  | not null | Token addresses that can be traded through this AMM
- block\_number      | bigint   | not null | Block number in which the AMM was deployed/finalized
- tx\_hash           | bytea    | not null | Transaction hash in which the AMM was deployed/finalized
-
-Indexes:
-- PRIMARY KEY: btree (`address`)
-- cow\_amms\_factory\_block: btree (`factory_address`, `block_number`)
+The `pool-indexer` service uses its own per-network database, not these shared DBs. Its tables (`pool_indexer_checkpoints`, `uniswap_v3_pools`, `uniswap_v3_pool_states`, `uniswap_v3_ticks`) and migrations live in [`sql-pool-indexer/`](sql-pool-indexer/).
 
 ### Enums
 

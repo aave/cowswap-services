@@ -498,6 +498,31 @@ pub async fn fetch_in_flight_orders(
         .await
 }
 
+/// Returns whether the given order uid appears in any solution of the
+/// `latest_competitions_count` most recent competitions.
+pub async fn order_is_in_recent_solutions(
+    ex: &mut PgConnection,
+    order_uid: &OrderUid,
+    latest_competitions_count: i64,
+) -> Result<bool, sqlx::Error> {
+    const QUERY: &str = r#"
+    SELECT EXISTS (
+        SELECT 1
+        FROM proposed_trade_executions pte
+        WHERE pte.order_uid = $1
+        AND pte.auction_id IN (
+            SELECT id FROM competition_auctions ORDER BY id DESC LIMIT $2
+        )
+    );
+    "#;
+
+    sqlx::query_scalar(QUERY)
+        .bind(order_uid)
+        .bind(latest_competitions_count)
+        .fetch_one(ex)
+        .await
+}
+
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct OrderProposedSolution {
     pub auction_id: AuctionId,
@@ -669,9 +694,17 @@ mod tests {
         settlements::update_settlement_auction(&mut db, 1, 0, 1)
             .await
             .unwrap();
-        settlements::update_settlement_solver(&mut db, 1, 0, ByteArray([1u8; 20]), 0)
-            .await
-            .unwrap();
+        settlements::update_settlement_solver_and_gas(
+            &mut db,
+            1,
+            0,
+            ByteArray([1u8; 20]),
+            0,
+            BigDecimal::from(100_000),
+            BigDecimal::from(1_000_000_000),
+        )
+        .await
+        .unwrap();
 
         // competition_auctions
         let auction = auction::Auction {
@@ -766,12 +799,14 @@ mod tests {
         settlements::update_settlement_auction(&mut db, block_number, log_index, auction_id)
             .await
             .unwrap();
-        settlements::update_settlement_solver(
+        settlements::update_settlement_solver_and_gas(
             &mut db,
             block_number,
             log_index,
             ByteArray([1u8; 20]),
             0,
+            BigDecimal::from(100_000),
+            BigDecimal::from(1_000_000_000),
         )
         .await
         .unwrap();
@@ -974,9 +1009,17 @@ mod tests {
             .await
             .unwrap();
         // associate with solution 3
-        settlements::update_settlement_solver(&mut db, 5, 0, Default::default(), 3)
-            .await
-            .unwrap();
+        settlements::update_settlement_solver_and_gas(
+            &mut db,
+            5,
+            0,
+            Default::default(),
+            3,
+            BigDecimal::from(100_000),
+            BigDecimal::from(1_000_000_000),
+        )
+        .await
+        .unwrap();
 
         // when an order gets marked as settled we dont consider it inflight anymore
         let later_block_with_settlement = fetch_in_flight_orders(&mut db, 5).await.unwrap();

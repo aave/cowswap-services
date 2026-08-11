@@ -279,6 +279,10 @@ struct SolverConfig {
     #[serde(default)]
     quote_using_limit_orders: bool,
 
+    /// Whether this solver supports fast-path (out-of-competition) execution.
+    #[serde(default)]
+    fast_path_enabled: bool,
+
     /// If enabled driver tries to merge multiple solutions for the same
     /// auction together.
     #[serde(default)]
@@ -470,22 +474,9 @@ struct ContractsConfig {
     /// Override the default address of the Signatures contract.
     signatures: Option<eth::Address>,
 
-    /// List of all cow amm factories with the corresponding helper contract.
-    #[serde(default)]
-    cow_amms: Vec<CowAmmConfig>,
-
     /// Flashloan router to support taking out multiple flashloans
     /// in the same settlement.
     flashloan_router: Option<eth::Address>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct CowAmmConfig {
-    /// CoW AMM factory address.
-    pub factory: eth::Address,
-    /// Which helper contract to use for interfacing with CoW AMMs.
-    pub helper: eth::Address,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -637,16 +628,7 @@ enum IndexerConfig {
         max_pools_per_tick_query: usize,
     },
     #[serde(rename_all = "kebab-case")]
-    PoolIndexer {
-        url: Url,
-        /// Upper bound on a single `wait_until` call. Size per-network to
-        /// comfortably exceed the worst-case first-deploy seed time.
-        #[serde(
-            with = "humantime_serde",
-            default = "uniswap_v3::default_pool_indexer_wait_until_timeout"
-        )]
-        wait_until_timeout: Duration,
-    },
+    PoolIndexer { url: Url },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -656,18 +638,12 @@ enum UniswapV3Preset {
 }
 
 mod uniswap_v3 {
-    use std::time::Duration;
-
     pub fn default_max_pools_to_initialize() -> usize {
         100
     }
 
     pub fn default_max_pools_per_tick_query() -> usize {
         usize::MAX
-    }
-
-    pub fn default_pool_indexer_wait_until_timeout() -> Duration {
-        Duration::from_secs(300)
     }
 }
 

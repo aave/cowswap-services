@@ -315,8 +315,7 @@ impl RunLoop {
         Metrics::auction(id);
 
         // always update the auction because the tests use this as a readiness probe
-        self.persistence.replace_current_auction_in_db(id, &auction);
-        self.persistence.upload_auction_to_s3(id, &auction);
+        self.persistence.archive_auction(id, &auction);
 
         if auction.orders.is_empty() {
             // Updating liveness probe to not report unhealthy due to this optimization
@@ -574,12 +573,6 @@ impl RunLoop {
             self.persistence
                 .save_competition(competition)
                 .map_err(|e| e.0.context("failed to save competition")),
-            self.persistence
-                .save_surplus_capturing_jit_order_owners(
-                    auction.id,
-                    &auction.surplus_capturing_jit_order_owners,
-                )
-                .map_err(|e| e.0.context("failed to save jit order owners")),
             self.persistence
                 .store_fee_policies(auction.id, fee_policies)
                 .map_err(|e| e.context("failed to fee_policies")),

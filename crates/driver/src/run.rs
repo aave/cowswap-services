@@ -7,7 +7,7 @@ use {
         infra::{
             self,
             Api,
-            blockchain::{self, Ethereum, gas},
+            blockchain::{self, Ethereum, RpcError, gas},
             cli,
             config,
             liquidity,
@@ -48,19 +48,25 @@ pub async fn run(
 /// Run the driver. This function exists to avoid multiple monomorphizations of
 /// the `run` code, which bloats the binaries and increases compile times.
 async fn run_with(args: cli::Args, addr_sender: Option<oneshot::Sender<SocketAddr>>) {
+    let ethrpc_res = ethrpc(&args).await;
+    let chain_name = ethrpc_res
+        .as_ref()
+        .map(|ethrpc| ethrpc.chain().name())
+        .unwrap_or("unknown");
+
     infra::observe::init(observe::Config::new(
         &args.log,
         args.stderr_threshold,
         args.use_json_logs,
-        tracing_config(&args.tracing, "driver".into()),
+        tracing_config(&args.tracing, format!("driver-{chain_name}")),
     ));
 
-    let ethrpc = ethrpc(&args).await;
+    let ethrpc = ethrpc_res.expect("connect ethereum RPC");
     let config = config::file::load(ethrpc.chain(), &args.config).await;
 
-    let commit_hash = option_env!("VERGEN_GIT_SHA").unwrap_or("COMMIT_INFO_NOT_FOUND");
+    let version = observe::version::git_version();
 
-    tracing::info!(%commit_hash, "running driver with {config:#?}");
+    tracing::info!(%version, "running driver with {config:#?}");
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
     let eth = Ethereum::new(
@@ -162,6 +168,7 @@ fn simulator(
     eth: simulator::Ethereum,
     http_factory: &HttpClientFactory,
 ) -> Simulator {
+    let block_stream = eth.current_block().clone();
     let mut simulator = match &config.simulator {
         configs::simulator::Config {
             kind: configs::simulator::SimulatorKind::Tenderly(config),
@@ -179,19 +186,21 @@ fn simulator(
     if let Some(gas) = config.disable_gas_simulation {
         simulator.disable_gas(gas);
     }
+    if let Some(cfg) = &config.simulator.state_override_stream {
+        simulator
+            .set_simulation_overrides(simulator::state_override_stream::spawn(cfg, block_stream));
+    }
 
     simulator
 }
 
-async fn ethrpc(args: &cli::Args) -> blockchain::Rpc {
+async fn ethrpc(args: &cli::Args) -> Result<blockchain::Rpc, RpcError> {
     let args = blockchain::RpcArgs {
         url: args.ethrpc.clone(),
         max_batch_size: args.ethrpc_max_batch_size,
         max_concurrent_requests: args.ethrpc_max_concurrent_requests,
     };
-    blockchain::Rpc::try_new(args)
-        .await
-        .expect("connect ethereum RPC")
+    blockchain::Rpc::try_new(args).await
 }
 
 async fn solvers(config: &config::Config, eth: &Ethereum) -> Vec<Solver> {

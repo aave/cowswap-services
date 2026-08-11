@@ -2,7 +2,6 @@ pub mod app_data;
 pub mod auction;
 pub mod auction_prices;
 pub mod byte_array;
-pub mod cow_amms;
 pub mod ethflow_orders;
 pub mod events;
 pub mod fee_policies;
@@ -19,9 +18,7 @@ pub mod quotes;
 pub mod reference_scores;
 pub mod settlement_executions;
 pub mod settlements;
-pub mod solver_competition;
 pub mod solver_competition_v2;
-pub mod surplus_capturing_jit_order_owners;
 pub mod trades;
 
 use {
@@ -53,7 +50,6 @@ pub type PgTransaction<'a> = sqlx::Transaction<'a, sqlx::Postgres>;
 pub const TABLES: &[&str] = &[
     "app_data",
     "auctions",
-    "cow_amms",
     "ethflow_orders",
     "ethflow_refunds",
     "interactions",
@@ -62,23 +58,17 @@ pub const TABLES: &[&str] = &[
     "last_indexed_blocks",
     "onchain_order_invalidations",
     "onchain_placed_orders",
-    "pool_indexer_checkpoints",
     "presignature_events",
     "proposed_jit_orders",
     "quotes",
     "reference_scores",
     "settlement_executions",
     "settlements",
-    "solver_competitions",
-    "surplus_capturing_jit_order_owners",
     "trades",
-    "uniswap_v3_pool_states",
-    "uniswap_v3_pools",
 ];
 
 /// The names of potentially big volume tables we use in the db.
 pub const LARGE_TABLES: &[&str] = &[
-    "auction_orders",
     "auction_prices",
     "competition_auctions",
     "fee_policies",
@@ -88,7 +78,6 @@ pub const LARGE_TABLES: &[&str] = &[
     "order_quotes",
     "proposed_solutions",
     "proposed_trade_executions",
-    "uniswap_v3_ticks",
 ];
 
 pub fn all_tables() -> impl Iterator<Item = &'static str> {
@@ -98,9 +87,8 @@ pub fn all_tables() -> impl Iterator<Item = &'static str> {
 /// Delete all data in the database. Only used by tests.
 ///
 /// Truncates all tables in a single statement so Postgres accepts foreign-key
-/// cycles between listed tables (e.g. `uniswap_v3_pool_states` →
-/// `uniswap_v3_pools`). Individual per-table `TRUNCATE`s error out when any
-/// other listed table references the one being truncated.
+/// cycles between listed tables. Individual per-table `TRUNCATE`s error out
+/// when any other listed table references the one being truncated.
 #[expect(non_snake_case)]
 pub async fn clear_DANGER_(ex: &mut PgTransaction<'_>) -> sqlx::Result<()> {
     let tables = all_tables().collect::<Vec<_>>().join(", ");
