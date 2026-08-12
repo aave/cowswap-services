@@ -14,7 +14,10 @@ use {
         ExternalSolver,
         buffered::{self, BufferedRequest, NativePriceBatchFetching},
         competition::PriceRanking,
-        config::{native_price::NativePriceConfig, price_estimation::BalanceOverridesConfigExt},
+        config::{
+            native_price::{Eip4626Config, NativePriceConfig},
+            price_estimation::BalanceOverridesConfigExt,
+        },
     },
     alloy::primitives::Address,
     anyhow::{Context as _, Result},
@@ -27,7 +30,7 @@ use {
     number::nonzero::NonZeroU256,
     rate_limit::RateLimiter,
     reqwest::Url,
-    simulator::{simulation_builder::SettlementSimulator, tenderly},
+    simulator::{self, simulation_builder::SettlementSimulator, tenderly},
     std::{collections::HashMap, num::NonZeroUsize, sync::Arc},
     token_info::TokenInfoFetching,
 };
@@ -119,6 +122,10 @@ impl<'a> PriceEstimatorFactory<'a> {
         });
         let settlement_contract =
             GPv2Settlement::GPv2Settlement::new(network.settlement, web3.provider.clone());
+        let simulation_overrides = args
+            .state_override_stream
+            .as_ref()
+            .map(|cfg| simulator::state_override_stream::spawn(cfg, network.block_stream.clone()));
         let simulator = SettlementSimulator::new(
             settlement_contract,
             network.flash_loan_router,
@@ -128,6 +135,7 @@ impl<'a> PriceEstimatorFactory<'a> {
             balance_overrides,
             network.block_stream.clone(),
             tenderly.clone(),
+            simulation_overrides,
         )
         .await?;
 
@@ -391,7 +399,7 @@ impl<'a> PriceEstimatorFactory<'a> {
         fast_price_estimation_results_required: NonZeroUsize,
         native: Arc<dyn NativePriceEstimating>,
         gas: Arc<dyn GasPriceEstimating>,
-    ) -> Result<Arc<dyn PriceEstimating>> {
+    ) -> Result<Arc<CompetitionEstimator<Arc<dyn PriceEstimating>>>> {
         let estimators = self.get_estimators(solvers, |entry| &entry.fast)?;
         Ok(Arc::new(
             self.sanitized_competition(estimators, PriceRanking::BestBangForBuck { native, gas })
@@ -399,9 +407,7 @@ impl<'a> PriceEstimatorFactory<'a> {
         ))
     }
 
-    /// Creates a native price estimator from the given sources. When `eip4626`
-    /// is true the resulting estimator is wrapped in an [`native::Eip4626`]
-    /// layer that transparently prices vault tokens.
+    /// Creates a native price estimator from the given sources.
     pub async fn native_price_estimator(
         &mut self,
         native: &[Vec<NativePriceEstimatorSource>],
@@ -427,23 +433,27 @@ impl<'a> PriceEstimatorFactory<'a> {
     /// Creates a [`CachingNativePriceEstimator`] that wraps a native price
     /// estimator with an in-memory cache.
     ///
-    /// If `eip4626` is true, it will wrap the estimator with EIP-4626
-    /// unwrapping.
+    /// If `eip4626` is enabled, the estimator is wrapped in a
+    /// [`native::Eip4626`] layer that transparently prices vault tokens.
     pub async fn caching_native_price_estimator(
         &mut self,
         native: &[Vec<NativePriceEstimatorSource>],
         results_required: NonZeroUsize,
         weth: &WETH9::Instance,
         cache: native_price_cache::Cache,
-        eip4626: bool,
+        eip4626: &Eip4626Config,
     ) -> native_price_cache::CachingNativePriceEstimator {
         let inner = self
             .native_price_estimator(native, results_required, weth)
             .await
             .expect("failed to build native price estimator");
-        let inner = if eip4626 {
+        let inner = if eip4626.enabled {
             Box::new(InstrumentedPriceEstimator::new(
-                native::Eip4626::new(inner, self.network.web3.provider.clone()),
+                native::Eip4626::new(
+                    inner,
+                    self.network.web3.provider.clone(),
+                    eip4626.exemptions.iter().copied(),
+                ),
                 "Eip4626".to_string(),
             ))
         } else {

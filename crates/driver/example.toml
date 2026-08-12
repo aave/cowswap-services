@@ -36,12 +36,6 @@ balances = "0x3e8C6De9510e7ECad902D005DE3Ab52f35cF4f1b"
 signatures = "0x8262d639c38470F38d2eff15926F7071c28057Af"
 flashloan-router = "0x0000000000000000000000000000000000000000"
 
-[[contracts.cow-amms]]
-# address of factory creating new CoW AMMs
-factory = "0x86f3df416979136cb4fdea2c0886301b911c163b"
-# address of contract to help interfacing with the created CoW AMMs
-helper = "0x86f3df416979136cb4fdea2c0886301b911c163b"
-
 [liquidity]
 base-tokens = [
   "0xDEf1CA1fb7FBcDC777520aa7f396b4E015F497aB",
@@ -98,7 +92,7 @@ max-order-age = "1m"
 
 # [[liquidity.uniswap-v3]] # Uniswap V3 configuration (pool-indexer as data source)
 # preset = "uniswap-v3"
-# indexer-config = { pool-indexer = { url = "http://pool-indexer/", wait-until-timeout = "5m" } }
+# indexer-config = { pool-indexer = { url = "http://pool-indexer/" } }
 # max_pools_to_initialize = 100
 
 # [[liquidity.uniswap-v3]] # Custom Uniswap V3 configuration
@@ -111,3 +105,10 @@ max-order-age = "1m"
 # base-url = "https://api.liquorice.tech/"
 # api-key = "..."
 # http_timeout = "10s"
+
+# Optional background websocket stream of # eth_call-style state overrides,
+# so live-quote venues (e.g. pAMMs) simulate against current in-memory state.
+# When absent, no stream task is spawned and behavior is unchanged.
+# [simulator.state-override-stream]
+# ws-url = "wss://eu.rpc.titanbuilder.xyz/ws/pamm_quote_stream"
+# max-age = "5s" # ignore the snapshot if the last frame is older than this
