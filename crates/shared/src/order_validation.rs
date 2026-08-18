@@ -594,9 +594,7 @@ impl OrderValidator {
                     TransferSimulationError::InsufficientAllowance
                     | TransferSimulationError::InsufficientBalance
                     | TransferSimulationError::TransferFailed(_)
-                        if order.signature == Signature::PreSign
-                            || has_wrappers
-                            || has_flashloan_for_sell_token =>
+                        if order.signature == Signature::PreSign || has_wrappers =>
                     {
                         // Pre-sign orders do not require sufficient balance or allowance.
                         // The idea is that this allows smart contracts to place orders bundled with
@@ -606,8 +604,15 @@ impl OrderValidator {
                         // relayer contract.
                         //
                         // Similarly, orders with wrappers may produce the required balance or
-                        // allowance as part of the wrapper execution, and an order whose
-                        // flashloan hint covers its sell token is funded by that loan.
+                        // allowance as part of the wrapper execution.
+                        return Ok(());
+                    }
+                    // A flashloan supplies the sell tokens at settlement, but it neither
+                    // creates the VaultRelayer approval nor fixes a reverting transfer, so it
+                    // exempts the balance failure only.
+                    TransferSimulationError::InsufficientBalance
+                        if has_flashloan_for_sell_token =>
+                    {
                         return Ok(());
                     }
                     TransferSimulationError::InsufficientAllowance => {
@@ -2761,6 +2766,45 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        // The case above is a pre-sign order, so it would be exempt with or without a
+        // flashloan hint. Repeat it with an ECDSA signature, which is what an
+        // adapter-driven position swap sends, so the hint itself is what has to
+        // carry the exemption.
+        let signed_order_with_sufficient_flashloan = OrderCreation {
+            valid_to: u32::MAX,
+            sell_token: Address::with_last_byte(1),
+            sell_amount: alloy::primitives::U256::from(100),
+            buy_token: Address::with_last_byte(2),
+            buy_amount: alloy::primitives::U256::from(1),
+            app_data: OrderCreationAppData::Full {
+                full: r#"{
+                    "metadata": {
+                        "flashloan": {
+                            "liquidityProvider": "0x1111111111111111111111111111111111111111",
+                            "protocolAdapter": "0x2222222222222222222222222222222222222222",
+                            "receiver": "0x0000000000000000000000000000000000000000",
+                            "token": "0x0000000000000000000000000000000000000001",
+                            "amount": "150"
+                        }
+                    }
+                }"#
+                .to_string(),
+            },
+            signature: Signature::Eip712(EcdsaSignature::non_zero()),
+            ..Default::default()
+        };
+
+        validator
+            .validate_and_construct_order(
+                signed_order_with_sufficient_flashloan,
+                &Default::default(),
+                Default::default(),
+                None,
+            )
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+
         // Test with flashloan hint that doesn't cover the sell amount
         let order_with_insufficient_flashloan = OrderCreation {
             valid_to: u32::MAX,
@@ -2834,6 +2878,78 @@ mod tests {
             .now_or_never()
             .unwrap();
         assert!(matches!(result, Err(ValidationError::InsufficientBalance)));
+    }
+
+    #[test]
+    fn flashloan_hint_does_not_exempt_missing_allowance() {
+        // A flashloan supplies the sell tokens but not the VaultRelayer approval, so an
+        // allowance failure must still be rejected even when the hint covers the order.
+        let mut order_quoter = MockOrderQuoting::new();
+        let mut balance_fetcher = MockBalanceFetching::new();
+        order_quoter
+            .expect_find_quote()
+            .returning(|_, _| Ok(Default::default()));
+        balance_fetcher
+            .expect_can_transfer()
+            .returning(|_, _| Err(TransferSimulationError::InsufficientAllowance));
+        let mut limit_order_counter = MockLimitOrderCounting::new();
+        limit_order_counter.expect_count().returning(|_| Ok(0u64));
+        let native_token = WETH9::Instance::new([0xef; 20].into(), ethrpc::mock::web3().provider);
+        let validator = OrderValidator::new(
+            native_token,
+            Arc::new(order_validation::banned::Users::none()),
+            OrderValidPeriodConfiguration::any(),
+            false,
+            Default::default(),
+            HooksTrampoline::Instance::new(
+                Address::repeat_byte(0xcf),
+                ProviderBuilder::new()
+                    .connect_mocked_client(Asserter::new())
+                    .erased(),
+            ),
+            Arc::new(order_quoter),
+            Arc::new(balance_fetcher),
+            Arc::new(MockSignatureValidating::new()),
+            None,
+            Arc::new(limit_order_counter),
+            0,
+            Default::default(),
+            u64::MAX,
+            SameTokensPolicy::Disallow,
+        );
+
+        let order = OrderCreation {
+            valid_to: u32::MAX,
+            sell_token: Address::with_last_byte(1),
+            sell_amount: alloy::primitives::U256::from(100),
+            buy_token: Address::with_last_byte(2),
+            buy_amount: alloy::primitives::U256::from(1),
+            app_data: OrderCreationAppData::Full {
+                full: r#"{
+                    "metadata": {
+                        "flashloan": {
+                            "liquidityProvider": "0x1111111111111111111111111111111111111111",
+                            "protocolAdapter": "0x2222222222222222222222222222222222222222",
+                            "receiver": "0x0000000000000000000000000000000000000000",
+                            "token": "0x0000000000000000000000000000000000000001",
+                            "amount": "150"
+                        }
+                    }
+                }"#
+                .to_string(),
+            },
+            signature: Signature::Eip712(EcdsaSignature::non_zero()),
+            ..Default::default()
+        };
+
+        let result = validator
+            .validate_and_construct_order(order, &Default::default(), Default::default(), None)
+            .now_or_never()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(ValidationError::InsufficientAllowance)
+        ));
     }
 
     #[tokio::test]
