@@ -568,6 +568,19 @@ impl OrderValidator {
         let simulate_transfers = async |transfer_amounts: &[U256]| {
             let mut res = Ok(());
             let has_wrappers = !app_data.inner.protocol.wrappers.is_empty();
+            // Nodes without debug_traceCall struct-logger support (e.g. Tenderly virtual
+            // testnets) cannot resolve the balance-override slot, so the override passed to
+            // `can_transfer` is silently ineffective and the simulation reports
+            // InsufficientBalance even though the flashloan supplies the sell tokens at
+            // settlement. Fall back to the hint itself, as CoW services <= v2.327.0 did.
+            let has_flashloan_for_sell_token = app_data
+                .inner
+                .protocol
+                .flashloan
+                .as_ref()
+                .is_some_and(|loan| {
+                    loan.token == order.data().sell_token && loan.amount >= order.data().sell_amount
+                });
 
             for transfer_amount in transfer_amounts {
                 let Err(err) = self
@@ -581,7 +594,9 @@ impl OrderValidator {
                     TransferSimulationError::InsufficientAllowance
                     | TransferSimulationError::InsufficientBalance
                     | TransferSimulationError::TransferFailed(_)
-                        if order.signature == Signature::PreSign || has_wrappers =>
+                        if order.signature == Signature::PreSign
+                            || has_wrappers
+                            || has_flashloan_for_sell_token =>
                     {
                         // Pre-sign orders do not require sufficient balance or allowance.
                         // The idea is that this allows smart contracts to place orders bundled with
@@ -591,7 +606,8 @@ impl OrderValidator {
                         // relayer contract.
                         //
                         // Similarly, orders with wrappers may produce the required balance or
-                        // allowance as part of the wrapper execution.
+                        // allowance as part of the wrapper execution, and an order whose
+                        // flashloan hint covers its sell token is funded by that loan.
                         return Ok(());
                     }
                     TransferSimulationError::InsufficientAllowance => {
